@@ -134,6 +134,9 @@ window.FwHubFiles = function (ctx) {
   const meta = el("span", { className: "fw-path fv-meta" });
   const body = el("div", { className: "run-body fv-body", tabIndex: 0 });
   let shownPath = "";
+  // What the viewer shows: the file's text, and whether it is cut short.
+  let shownText = null;
+  let shownTruncated = false;
   dialog.append(
     el(
       "header",
@@ -142,6 +145,20 @@ window.FwHubFiles = function (ctx) {
       el(
         "span",
         { className: "fv-tools" },
+        el("button", {
+          type: "button",
+          className: "slab ghost fv-copy",
+          textContent: "Copy contents",
+          onclick: () => {
+            if (shownText == null) return toast("Nothing to copy yet.", { tone: "bad" });
+            copyText(shownText).then((ok) =>
+              toast(
+                ok ? (shownTruncated ? "Copied the part shown (the file is longer)" : "Contents copied") : "Copy failed: this browser refused the clipboard.",
+                { tone: ok ? "" : "bad" },
+              ),
+            );
+          },
+        }),
         el("button", {
           type: "button",
           className: "slab ghost fv-copy",
@@ -171,6 +188,8 @@ window.FwHubFiles = function (ctx) {
     title.textContent = line ? `${path}:${line}` : path;
     meta.textContent = "";
     shownPath = path;
+    shownText = null;
+    shownTruncated = false;
     body.replaceChildren(el("p", { className: "tx-note", textContent: "Reading…" }));
     if (!dialog.open) dialog.showModal();
     let file;
@@ -182,6 +201,8 @@ window.FwHubFiles = function (ctx) {
     }
     if (mine !== seq) return;
     shownPath = file.path;
+    shownText = file.text;
+    shownTruncated = !!file.truncated;
     const lines = file.text.split("\n");
     if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
     meta.textContent = `${file.path} · ${bytes(file.size)} · ${lines.length} line${lines.length === 1 ? "" : "s"}${file.truncated ? ` · first ${bytes(file.text.length)} shown` : ""}`;

@@ -46,6 +46,16 @@ pub const MAX_PER_HUB: usize = 2000;
 pub const MAX_PROMPT_BYTES: usize = 4096;
 /// Events a queued prompt lists; the rest are counted.
 pub const MAX_LINES: usize = 40;
+/// Most bytes of closing messages one wake carries in full; past them a
+/// finished turn is one summary line (`fw hub tail` has the rest).
+pub const MAX_ENDINGS_BYTES: usize = 12 * 1024;
+/// The watch the hub arms for a session when it starts its first child
+/// ([`Hub::ensure_children_watch`]).
+pub const DEFAULT_CHILDREN_FILTER: &str = "children state=done|blocked|failed|asking";
+/// That watch's prompt.
+pub const DEFAULT_CHILDREN_PROMPT: &str = "A session you started moved (the hub armed this \
+     watch when you started it). Its closing message below is its report: act on it; fetch \
+     more only if the report is not enough.";
 /// The shortest and longest `every`, and how far ahead (or behind) `at`
 /// may be.
 pub const MIN_EVERY_SECS: u32 = 300;
@@ -284,8 +294,17 @@ pub struct NewWatch {
     pub every: Option<String>,
 }
 
-/// One event in a watch's prompt: when, who, what.
+/// One event in a watch's prompt: when, who, what. A finished turn's
+/// closing message (`ending`, already bounded at capture) follows in full,
+/// indented: it is the session's report, so the woken agent need not
+/// fetch it.
 pub fn line(row: &LogRow) -> String {
+    line_with(row, true)
+}
+
+/// [`line`], the closing message given in full only when `full` (else
+/// left to the one-line summary).
+fn line_with(row: &LogRow, full: bool) -> String {
     let when = DateTime::from_timestamp_millis(row.ts)
         .map(|t| t.format("%H:%M:%S").to_string())
         .unwrap_or_default();
@@ -298,13 +317,47 @@ pub fn line(row: &LogRow) -> String {
         .as_deref()
         .map(|s| format!(" -> {s}"))
         .unwrap_or_default();
-    let what = crate::telemetry::log::summary(&row.body);
-    format!(
+    let mut body = row.body.clone();
+    let ending = body
+        .as_object_mut()
+        .filter(|_| full)
+        .and_then(|map| map.remove("ending"))
+        .and_then(|e| e.as_str().map(str::to_owned))
+        .filter(|e| !e.trim().is_empty());
+    let what = crate::telemetry::log::summary(&body);
+    let mut out = format!(
         "{when} {who} ({}) {}{moved}{}{what}",
         row.session,
         row.kind,
         if what.is_empty() { "" } else { " " }
-    )
+    );
+    if let Some(ending) = ending {
+        out.push_str(", closing message:");
+        for text in ending.lines() {
+            out.push_str("\n    ");
+            out.push_str(&crate::commands_cli::visible_controls(text));
+        }
+    }
+    out
+}
+
+/// Each row's [`line`], closing messages in full while they fit in
+/// `budget` bytes.
+fn lines_within(rows: &[LogRow], budget: usize) -> Vec<String> {
+    let mut left = budget;
+    rows.iter()
+        .map(|row| {
+            let full = line_with(row, true);
+            let short = line_with(row, false);
+            let extra = full.len().saturating_sub(short.len());
+            if extra <= left {
+                left -= extra;
+                full
+            } else {
+                short
+            }
+        })
+        .collect()
 }
 
 /// The engine's memory: how far each watch has looked, and its matches
@@ -390,6 +443,26 @@ impl Hub {
             ))
             .into());
         }
+        // The same filter armed again by its owner: one watch, its prompt
+        // and window replaced (two would wake it twice for every event).
+        // A new watch on its children replaces the one the hub armed for
+        // it when it started its first ([`DEFAULT_CHILDREN_PROMPT`]).
+        if time.is_none() {
+            let mine = self.watches(Some(&owner.id));
+            if let Some(same) = mine.iter().find(|w| w.time.is_none() && w.filter == filter) {
+                let watch = self.store().rearm_watch(&same.id, prompt, window_secs)?;
+                self.queue_changed();
+                return Ok(watch);
+            }
+            if filter.children.is_some() {
+                for default in mine
+                    .iter()
+                    .filter(|w| w.time.is_none() && w.prompt == DEFAULT_CHILDREN_PROMPT)
+                {
+                    self.watch_remove(&default.id)?;
+                }
+            }
+        }
         let cursor = match self.log_cursor(new.after.as_deref())? {
             Some(at) => at,
             None => self.telemetry().log_head()?.at,
@@ -456,6 +529,29 @@ impl Hub {
             watch.window_secs,
             watch.short()
         ))
+    }
+
+    /// Arm the default watch on `caller`'s children unless it already
+    /// watches them: a session it starts reports by ending its turn, and
+    /// that report reaches `caller` only through a watch. Best effort: a
+    /// start never fails for it.
+    pub(crate) fn ensure_children_watch(&self, caller: &str) {
+        if self
+            .watches(Some(caller))
+            .iter()
+            .any(|w| w.filter.children.is_some())
+        {
+            return;
+        }
+        let new = NewWatch {
+            owner: caller.to_owned(),
+            filter: DEFAULT_CHILDREN_FILTER.to_owned(),
+            prompt: DEFAULT_CHILDREN_PROMPT.to_owned(),
+            ..NewWatch::default()
+        };
+        if let Err(e) = self.watch_add(&new, None) {
+            eprintln!("fw hub: default children watch for {caller}: {e}");
+        }
     }
 
     /// The `unwatch` agent tool: disarm one of `caller`'s watches, or all.
@@ -849,7 +945,7 @@ impl Hub {
         let first = rows.first().map_or(looked, |r| r.at - 1);
         let from = Cursor { epoch, at: first }.encode();
         let to = Cursor { epoch, at: looked }.encode();
-        let lines: Vec<String> = rows.iter().map(line).collect();
+        let lines = lines_within(rows, MAX_ENDINGS_BYTES);
         let delivered = self
             .store()
             .queue_watch(&watch.id, &lines, &from, &to, looked, None)?;
@@ -900,6 +996,68 @@ impl Hub {
         if let Err(e) = spawned {
             eprintln!("fw hub: watches are off: cannot start their thread: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    fn finished(name: &str, ending: Option<&str>) -> LogRow {
+        LogRow {
+            cursor: String::new(),
+            at: 1,
+            host: "h".into(),
+            session: format!("{name}-id"),
+            seq: 1,
+            ts: 0,
+            kind: "turn.finished".into(),
+            state: Some("done".into()),
+            agent: None,
+            body: match ending {
+                Some(e) => serde_json::json!({ "turn": "t1", "ending": e }),
+                None => serde_json::json!({ "turn": "t1" }),
+            },
+            name: Some(name.into()),
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn a_finished_turns_closing_message_comes_in_full() {
+        let report = format!(
+            "Outcome: shipped.\nbranch fix/x at abc123\n{}",
+            "y".repeat(400)
+        );
+        let text = line(&finished("c1", Some(&report)));
+        assert!(
+            text.starts_with("00:00:00 c1 (c1-id) turn.finished -> done turn=t1, closing message:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n    Outcome: shipped.\n    branch fix/x at abc123\n"),
+            "{text}"
+        );
+        assert!(text.ends_with(&"y".repeat(400)), "{text}");
+        assert!(!text.contains("ending="), "{text}");
+        let quiet = line(&finished("c2", None));
+        assert!(!quiet.contains("closing message"), "{quiet}");
+    }
+
+    #[test]
+    fn closing_messages_past_the_budget_are_one_line() {
+        let long = "z".repeat(1000);
+        let rows: Vec<LogRow> = (0..5)
+            .map(|n| finished(&format!("c{n}"), Some(&long)))
+            .collect();
+        let lines = lines_within(&rows, 2500);
+        let full = lines
+            .iter()
+            .filter(|l| l.contains("closing message"))
+            .count();
+        assert_eq!(full, 2, "{lines:?}");
+        assert!(lines[4].contains("ending="), "{}", lines[4]);
+        assert!(lines[4].len() < 200, "{}", lines[4]);
     }
 }
 

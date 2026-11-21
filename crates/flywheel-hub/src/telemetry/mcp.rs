@@ -330,9 +330,12 @@ fn start_tool() -> Value {
                         permission options as you; it is linked to you). Write its complete \
                         first prompt: it has none of this conversation. It starts at once, or \
                         waits for the operator's approval if they set it so; either way keep \
-                        working, and call it again for more sessions. Message it with \
-                        message_session; check on it with session_status. To continue your own \
-                        work in a fresh session, use handoff instead.",
+                        working, and call it again for more sessions. It reports by ending \
+                        its turn: unless you already watch your children, the hub arms \
+                        \"children state=done|blocked|failed|asking\" for you, and each \
+                        report arrives as your next prompt in full, so end your turn to wait \
+                        rather than polling session_status. Message it with message_session. \
+                        To continue your own work in a fresh session, use handoff instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -383,7 +386,8 @@ fn message_tool() -> Value {
                         list_sessions): it arrives as that agent's next prompt, under a line \
                         naming you, now if it is idle or once its current turn is done. For \
                         coordinating shared work: a heads-up, a result it needs, a request. Do \
-                        not use it to reach the operator (ask_operator does that). Give a \
+                        not send your final report to the session that started you: your \
+                        closing message reaches it. Do not use it to reach the operator (ask_operator does that). Give a \
                         topic to one decision or request so a later change to it replaces \
                         the earlier message instead of arriving after it.",
         "inputSchema": {
@@ -610,7 +614,9 @@ fn watch_tool() -> Value {
                         match. By time instead of filter: at (\"2026-11-23T12:00Z\" or \
                         \"+36h\") wakes you once; every (\"6h\", at least 5m) wakes you \
                         repeatedly; a time watch survives hub restarts and passes to your \
-                        successor. A watch lasts until unwatch or until you end.",
+                        successor. A finished turn's closing message (its report) comes in \
+                        full with its event. Arming a filter you already watch replaces that \
+                        watch's prompt. A watch lasts until unwatch or until you end.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -1420,7 +1420,7 @@ async fn agents_start_sessions_within_their_policy_and_limits() {
     let argv = launched_with(&hub, "Goal: build part A.").await;
     assert!(argv.contains("From lead in repo: "), "{argv}");
     assert!(
-        argv.contains(&format!("message_session (to: {lead})")),
+        argv.contains(&format!("started by lead (id {lead})")),
         "{argv}"
     );
     let worker_id = worker["id"].as_str().unwrap().to_owned();

@@ -224,8 +224,9 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())?
         {
             crate::hub::Opened::Started(view) => Ok(format!(
-                "Started {name} (id {id}), opened by you. It shows in list_sessions; message it \
-                 with message_session, check on it with session_status.",
+                "Started {name} (id {id}), opened by you. It shows in list_sessions. Its report \
+                 (its closing message) wakes you through your children watch: end your turn to \
+                 wait instead of polling session_status.",
                 name = view.record.name,
                 id = view.record.id,
             )),

@@ -1114,6 +1114,28 @@ impl HubStore {
         Ok(removed)
     }
 
+    /// Give watch `id` a new `prompt` and `window_secs`, keeping its
+    /// cursor and anything it has gathered.
+    pub fn rearm_watch(
+        &mut self,
+        id: &str,
+        prompt: &str,
+        window_secs: u32,
+    ) -> Result<crate::watch::Watch, StateError> {
+        let at = self
+            .doc
+            .watches
+            .iter()
+            .position(|w| w.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("watch {id}")))?;
+        let previous = self.doc.watches[at].clone();
+        self.doc.watches[at].prompt = prompt.to_owned();
+        self.doc.watches[at].window_secs = window_secs;
+        let rearmed = self.doc.watches[at].clone();
+        self.save_or_rollback(move |doc| doc.watches[at] = previous)?;
+        Ok(rearmed)
+    }
+
     /// Disarm watch `id`.
     pub fn remove_watch(&mut self, id: &str) -> Result<crate::watch::Watch, StateError> {
         let at = self

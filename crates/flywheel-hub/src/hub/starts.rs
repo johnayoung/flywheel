@@ -209,6 +209,8 @@ impl Hub {
         let view = self.create_session(request)?;
         // The caller may be gone meanwhile: nothing left to count on.
         let _ = self.store().count_start(&caller.id);
+        // Its report is its closing message: a watch carries it back.
+        self.ensure_children_watch(&caller.id);
         Ok(view)
     }
 
@@ -670,9 +672,13 @@ fn started_prompt(caller: &SessionRecord, prompt: &str) -> String {
         "this session was started by that agent session",
     );
     format!(
-        "{from}\n\nYou were started by {name} (id {id}). Report your results to it with \
-         mcp__flywheel__message_session (to: {id}); ask the operator only what it cannot \
-         answer.\n\n{prompt}",
+        "{from}\n\nYou were started by {name} (id {id}). Your report is your closing \
+         message: when you finish, or stop on something only {name} or the operator can \
+         settle, end your turn with it (at most ~1500 characters; outcome first, then \
+         branch and commit, then what {name} must do). The hub delivers it to {name} in \
+         full, so do not also send it with mcp__flywheel__message_session; send that only \
+         for something {name} needs while you keep working. Ask the operator only what \
+         {name} cannot answer.\n\n{prompt}",
         name = caller.name,
         id = caller.id,
     )
@@ -797,7 +803,8 @@ mod tests {
         let lead = record("lead1", None, true);
         let prompt = started_prompt(&lead, "Goal: fix it");
         assert!(prompt.starts_with("From s-lead1 in r: "), "{prompt}");
-        assert!(prompt.contains("message_session (to: lead1)"), "{prompt}");
+        assert!(prompt.contains("started by s-lead1 (id lead1)"), "{prompt}");
+        assert!(prompt.contains("closing message"), "{prompt}");
         assert!(prompt.ends_with("Goal: fix it"), "{prompt}");
     }
 

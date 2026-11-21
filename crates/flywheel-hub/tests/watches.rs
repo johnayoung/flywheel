@@ -220,6 +220,23 @@ impl Agent {
         .unwrap();
     }
 
+    /// [`Agent::fire`] with the hook's JSON payload.
+    async fn fire_with(&self, event: &str, payload: Value) {
+        let env = self.env().await;
+        report::send(
+            Path::new(&env[report::SOCKET_ENV]),
+            &Report {
+                session: env[report::SESSION_ENV].clone(),
+                secret: env[report::SECRET_ENV].clone(),
+                source: "claude".into(),
+                event: event.into(),
+                detail: None,
+                payload: Some(payload),
+            },
+        )
+        .unwrap();
+    }
+
     fn typed(&self) -> Vec<u8> {
         std::fs::read(self.path("in")).unwrap_or_default()
     }
@@ -412,4 +429,111 @@ async fn five_hundred_children_finishing_at_once_are_one_prompt() {
         "{text}"
     );
     assert!(text.len() < 16 * 1024, "{} bytes", text.len());
+}
+
+/// The state a session shows (`agent.state`).
+async fn shown(t: &TestHub, sid: &str) -> Value {
+    t.get("/api/sessions").await["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sid)
+        .map_or(Value::Null, |s| s["agent"]["state"].clone())
+}
+
+async fn shown_is(t: &TestHub, sid: &str, want: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let now = shown(t, sid).await;
+        if now == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{sid} shows {now}, never {want}");
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_started_child_reports_by_its_closing_message_and_holds_its_lead() {
+    use flywheel_hub::watch::{DEFAULT_CHILDREN_FILTER, DEFAULT_CHILDREN_PROMPT};
+    let t = TestHub::start().await;
+    let ws = t.workspace("w").await;
+    let lead = t.claude(&ws, "lead").await;
+    lead.fire("SessionStart", None).await;
+    lead.fire_with("UserPromptSubmit", json!({ "prompt": "lead the work" }))
+        .await;
+    t.status_is(&lead.id, "working").await;
+    let (status, _) = t
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/sessions/{}/start-policy", lead.id),
+            Some(json!({ "policy": "allowed" })),
+        )
+        .await;
+    assert!(status.is_success());
+    let made = t
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "claude", "name": "c1",
+                    "opened_by": lead.id, "cols": 100, "rows": 30 }),
+        )
+        .await;
+    let child = Agent {
+        id: made["id"].as_str().unwrap().to_owned(),
+        log: t.root.join("log"),
+    };
+    child.fire("SessionStart", None).await;
+    child
+        .fire_with("UserPromptSubmit", json!({ "prompt": "do it" }))
+        .await;
+    t.status_is(&child.id, "working").await;
+
+    // Starting it armed the lead's children watch.
+    let listed = t.get(&format!("/api/watches?session={}", lead.id)).await;
+    let watches = listed["watches"].as_array().unwrap();
+    assert_eq!(watches.len(), 1, "{listed}");
+    assert_eq!(watches[0]["filter"]["children"], lead.id.as_str());
+    assert_eq!(watches[0]["prompt"], DEFAULT_CHILDREN_PROMPT);
+    let armed = watches[0]["id"].clone();
+    // Arming the same filter again replaces its prompt: still one watch.
+    t.post(
+        "/api/watches",
+        json!({ "owner": lead.id, "filter": DEFAULT_CHILDREN_FILTER, "prompt": "Mine." }),
+    )
+    .await;
+    let listed = t.get(&format!("/api/watches?session={}", lead.id)).await;
+    let watches = listed["watches"].as_array().unwrap();
+    assert_eq!(watches.len(), 1, "{listed}");
+    assert_eq!(watches[0]["id"], armed);
+    assert_eq!(watches[0]["prompt"], "Mine.");
+
+    // The lead's turn ends while its child works: it waits, not done.
+    lead.fire_with(
+        "Stop",
+        json!({ "last_assistant_message": "Waiting on c1." }),
+    )
+    .await;
+    shown_is(&t, &lead.id, "background").await;
+
+    // The child finishes: its closing message reaches the lead in full,
+    // and the lead, waiting on nobody now, is done.
+    let report = "Outcome: shipped.\nbranch c1 at abc123\nNeeds: review.";
+    child
+        .fire_with("Stop", json!({ "last_assistant_message": report }))
+        .await;
+    let deadline = Instant::now() + WAIT;
+    let want =
+        "closing message:\r    Outcome: shipped.\r    branch c1 at abc123\r    Needs: review.";
+    let alt =
+        "closing message:\n    Outcome: shipped.\n    branch c1 at abc123\n    Needs: review.";
+    loop {
+        let typed = String::from_utf8_lossy(&lead.typed()).to_string();
+        if typed.contains(want) || typed.contains(alt) {
+            assert!(typed.contains("Mine."), "{typed}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never delivered: {typed:?}");
+        sleep(Duration::from_millis(50)).await;
+    }
+    shown_is(&t, &lead.id, "done").await;
 }

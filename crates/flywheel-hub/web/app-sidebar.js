@@ -64,6 +64,37 @@ async function stopSession(id) {
   }
 }
 
+// A session dragged onto an agent's row goes under that agent (it owns it
+// now: hears its reports, may end or replace it); Undo puts it back.
+const canNestUnder = (lead, id) =>
+  !!id && id !== lead.id && lead.kind !== "shell" && lead.state === "running" && !!sessionById(id);
+
+async function nestUnder(id, lead) {
+  const session = sessionById(id);
+  if (!session || session.parent === lead.id) return;
+  const before = session.owner || null;
+  try {
+    await api("PUT", `/api/sessions/${id}/owner`, { owner: lead.id });
+    await refresh();
+    commands.toast(`${session.name} is now under ${lead.name}`, {
+      timeout: 8000,
+      actions: [
+        el("button", {
+          type: "button",
+          className: "text-btn",
+          textContent: "Undo",
+          onclick: () =>
+            api("PUT", `/api/sessions/${id}/owner`, { owner: before })
+              .then(() => refresh())
+              .catch((error) => commands.toast(error.message, { tone: "bad" })),
+        }),
+      ],
+    });
+  } catch (error) {
+    commands.toast(`Not moved: ${error.message}`, { tone: "bad", timeout: 6000 });
+  }
+}
+
 async function closeSession(id) {
   const session = sessionById(id);
   if (!session) return;
@@ -360,6 +391,25 @@ function renderSession(session, opts = {}) {
         e.dataTransfer.setData(DRAG_TYPE, session.id);
         e.dataTransfer.setData("text/plain", session.name);
         e.dataTransfer.effectAllowed = "copyMove";
+      },
+      // Dropped on an agent's row: it goes under that agent.
+      ondragover: (e) => {
+        if (!canNestUnder(session, dragged)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        e.currentTarget.classList.add("nest-target");
+      },
+      ondragleave: (e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove("nest-target");
+      },
+      ondrop: (e) => {
+        e.currentTarget.classList.remove("nest-target");
+        const id = dragged || e.dataTransfer.getData(DRAG_TYPE);
+        if (!canNestUnder(session, id)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragged = null;
+        nestUnder(id, session);
       },
       // The inspector floats beside the row it is over (never in the
       // list: no row moves for it).

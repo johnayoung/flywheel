@@ -409,6 +409,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             axum::routing::delete(cancel_ending),
         )
         .route("/api/sessions/{id}/start-policy", put(set_start_policy))
+        .route("/api/sessions/{id}/owner", put(sessions_api::set_owner))
         .route(
             "/api/sessions/{id}/labels",
             get(sessions_api::get_labels).patch(sessions_api::patch_labels),

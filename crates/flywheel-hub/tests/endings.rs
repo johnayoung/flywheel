@@ -1883,6 +1883,47 @@ async fn a_turn_stopped_by_a_rate_limit_is_woken_when_it_resets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_operator_puts_a_session_under_a_lead_and_back() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    let solo = hub.claude("solo", None, json!({})).await;
+    for agent in [&lead, &solo] {
+        agent.turn().await;
+    }
+    let put = |id: &str, owner: Value| {
+        let path = format!("/api/sessions/{id}/owner");
+        let hub = &hub;
+        async move {
+            hub.call(reqwest::Method::PUT, &path, Some(json!({ "owner": owner })))
+                .await
+        }
+    };
+    let (status, view) = put(&solo.id, json!("lead")).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["owner"], lead.id.as_str());
+    assert_eq!(view["parent"], lead.id.as_str());
+    assert_eq!(view["labels"]["fw.parent"], lead.id.as_str());
+    hub.told(&lead, "the operator put solo").await;
+    let watches = hub.get(&format!("/api/watches?session={}", lead.id)).await;
+    assert_eq!(
+        watches["watches"][0]["filter"]["children"],
+        lead.id.as_str(),
+        "{watches}"
+    );
+    // Not a loop, not itself.
+    let (status, said) = put(&lead.id, json!("solo")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+    assert!(said.to_string().contains("loop"), "{said}");
+    let (status, _) = put(&solo.id, json!("solo")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Undo: back on its own.
+    let (status, view) = put(&solo.id, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view["parent"].is_null(), "{view}");
+    assert!(view["labels"]["fw.parent"].is_null(), "{view}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     let mut hub = TestHub::start().await;
     let lead = hub.claude("lead", None, json!({})).await;

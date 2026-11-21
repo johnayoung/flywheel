@@ -1043,6 +1043,88 @@ impl Hub {
         ))
     }
 
+    /// The operator puts session `id` under agent session `owner` (the
+    /// sidebar's drag onto a lead), or back under whoever opened it
+    /// (`None`). Refused: a session under itself or under one of its own
+    /// (a loop), or an owner that is not a running agent. The new owner is
+    /// told and watches its children. The session, as it now is.
+    pub fn set_owner(&self, id: &str, owner: Option<&str>) -> Result<SessionView, HubError> {
+        let target = self.store().session(id)?.clone();
+        let next = match owner.map(str::trim).filter(|o| !o.is_empty()) {
+            None => None,
+            Some(wanted) => {
+                let next = self.session_named(wanted)?;
+                if next.id == target.id {
+                    return Err(refused("a session cannot own itself"));
+                }
+                if !running_agent(&next) {
+                    return Err(refused(format!(
+                        "{} is not a running agent session",
+                        next.name
+                    )));
+                }
+                // Not under one of its own: walk up from the new owner.
+                let store = self.store();
+                let sessions = store.sessions();
+                let mut at = Some(next.id.clone());
+                let mut seen = HashSet::new();
+                while let Some(here) = at {
+                    if here == target.id {
+                        return Err(refused(format!(
+                            "{} is under {} already: that would be a loop",
+                            next.name, target.name
+                        )));
+                    }
+                    if !seen.insert(here.clone()) {
+                        break;
+                    }
+                    at = sessions
+                        .iter()
+                        .find(|s| s.id == here)
+                        .and_then(|s| effective_parent(s, sessions));
+                }
+                Some(next)
+            }
+        };
+        let previous = target.owner.clone();
+        let next_id = next.as_ref().map(|n| n.id.clone());
+        self.store()
+            .update_session(&target.id, |r| r.owner = next_id)?;
+        self.refresh_parents();
+        self.emit(HubEvent::Sessions);
+        let now_under = {
+            let store = self.store();
+            store
+                .session(&target.id)
+                .ok()
+                .and_then(|r| effective_owner(r, store.sessions()))
+        };
+        self.telemetry().record(
+            &target.id,
+            vec![Draft::new(
+                now_ms(),
+                What::OwnerChanged {
+                    from: previous,
+                    to: now_under.clone().unwrap_or_default(),
+                    by: "operator".to_owned(),
+                },
+            )],
+        );
+        if let Some(next) = &next {
+            self.tell(
+                &next.id,
+                &format!(
+                    "From the flywheel hub: the operator put {} (id {}) under you. Its report \
+                     (its closing message) reaches you through your children watch; you may \
+                     end, replace, or give it; check on it with session_status.",
+                    target.name, target.id
+                ),
+            );
+            self.ensure_children_watch(&next.id);
+        }
+        self.session(&target.id)
+    }
+
     /// The operator approves session `id`'s pending end `end`: it starts
     /// as if the asker owned the target; the asker is told.
     pub fn approve_end(self: &Arc<Self>, id: &str, end: &str) -> Result<SessionView, HubError> {

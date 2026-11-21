@@ -49,6 +49,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | DELETE | `/api/sessions/{id}/ending` | call off its end |
 | GET / PATCH | `/api/sessions/{id}/labels` | `{"labels","state"}` / `{"labels":{k:v\|null},"if"?\|"if_unset"?}`; 409 condition failed |
 | PUT | `/api/sessions/{id}/start-policy` | `{"policy"}`: `ask` `allowed` `off` `default` |
+| PUT | `/api/sessions/{id}/owner` | `{"owner"}`: a lead or null |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |

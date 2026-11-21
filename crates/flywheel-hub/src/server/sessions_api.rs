@@ -320,6 +320,24 @@ pub(super) async fn set_start_policy(
     Ok(Json(view).into_response())
 }
 
+#[derive(Deserialize)]
+pub(super) struct OwnerRequest {
+    /// The agent session to put it under (id or name); null: back under
+    /// whoever opened it.
+    owner: Option<String>,
+}
+
+/// Put a session under a lead (or back under its opener): the session.
+pub(super) async fn set_owner(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<OwnerRequest>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.set_owner(&id, request.owner.as_deref())).await?;
+    Ok(Json(view).into_response())
+}
+
 /// Dismiss a pending handoff unstarted: 204.
 pub(super) async fn dismiss_handoff(
     State(app): State<AppState>,

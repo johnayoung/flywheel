@@ -735,3 +735,6 @@ body.list-hidden .side-list { display: none; }
   font-size: 11px;
   line-height: 1.6;
 }
+
+/* A row a dragged session would go under (app-sidebar.js nestUnder). */
+.session.nest-target { outline: 1px dashed var(--signal); outline-offset: -1px; background: var(--signal-soft); }

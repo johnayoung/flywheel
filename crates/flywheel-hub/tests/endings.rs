@@ -659,8 +659,12 @@ async fn senders_see_and_cancel_only_their_own_messages_and_priority_goes_first(
         )
         .await;
     assert!(said.contains("#2 in its queue"), "{said}");
-    lead.ok("message_session", json!({"to": "worker", "text": "L2"}))
-        .await;
+    // A topic keeps it its own item (untopical, it would join L1).
+    lead.ok(
+        "message_session",
+        json!({"to": "worker", "text": "L2", "topic": "later"}),
+    )
+    .await;
     let view = hub.queue(&worker.id).await;
     assert_eq!(waiting(&view), ["LP1", "OP1", "L1", "O1", "L2"]);
     let id_of = |text: &str| -> String {
@@ -1800,8 +1804,9 @@ async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     assert!(said.contains("survives hub restarts"), "{said}");
     old.typed_has("check the captures are done").await;
     old.typed_has("] due ").await;
+    // (The lead's own children watch, armed when it started old, stays.)
     let deadline = Instant::now() + WAIT;
-    while !hub.get("/api/watches").await["watches"]
+    while !hub.get(&format!("/api/watches?session={}", old.id)).await["watches"]
         .as_array()
         .unwrap()
         .is_empty()
@@ -1831,7 +1836,7 @@ async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     old.ok("watch", json!({"every": "6h", "prompt": "rotate the logs"}))
         .await;
     let mut hub = hub.restart(|_| {}).await;
-    let watches = hub.get("/api/watches").await;
+    let watches = hub.get(&format!("/api/watches?session={}", old.id)).await;
     assert_eq!(
         watches["watches"][0]["time"]["every_secs"], 21600,
         "{watches}"
@@ -1853,7 +1858,12 @@ async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     let new = hub.named("new").await.expect("the successor started");
     let deadline = Instant::now() + WAIT;
     loop {
-        let watches = hub.get("/api/watches").await;
+        let watches = hub
+            .get(&format!(
+                "/api/watches?session={}",
+                new["id"].as_str().unwrap()
+            ))
+            .await;
         if watches["watches"][0]["owner"] == new["id"] {
             break;
         }

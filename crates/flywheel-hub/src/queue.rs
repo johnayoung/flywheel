@@ -280,7 +280,64 @@ pub fn superseded_line(topic: &str, at: DateTime<Utc>) -> String {
     )
 }
 
+/// What [`SessionQueue::join_unread`] did with a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Joined {
+    /// Appended to the sender's unread item `item`.
+    Appended { item: String },
+    /// The same text already waits in `item`: nothing added.
+    Repeat { item: String },
+}
+
+/// The line between two messages joined into one item.
+pub const JOINED_LINE: &str = "-- and then, from the same session:";
+
 impl SessionQueue {
+    /// Join `text` (a header paragraph, then the message) from agent
+    /// session `sender` to its newest message still unread here (pending,
+    /// no topic, not priority, not a watch's): one prompt, so a burst of
+    /// messages is one turn and the queue holds one item per sender. The
+    /// header is not repeated when it is the same; an exact repeat is
+    /// dropped. `None`: nothing to join (or it would pass
+    /// [`MAX_TEXT_BYTES`]): queue it on its own.
+    pub fn join_unread(&mut self, sender: &str, text: &str) -> Option<Joined> {
+        let (head, body) = text.split_once("\n\n").unwrap_or(("", text));
+        let item = self.items.iter_mut().rev().find(|i| {
+            matches!(i.state, ItemState::Pending)
+                && i.from.as_deref() == Some(sender)
+                && i.topic.is_none()
+                && !i.priority
+                && i.watch.is_none()
+                && i.when == When::Done
+        })?;
+        let separator = format!("\n\n{JOINED_LINE}\n\n");
+        let repeat = item.text.split(separator.as_str()).any(|part| {
+            let part = part.trim();
+            part == body.trim()
+                || part
+                    .split_once("\n\n")
+                    .is_some_and(|(_, rest)| rest.trim() == body.trim())
+        });
+        if repeat {
+            return Some(Joined::Repeat {
+                item: item.id.clone(),
+            });
+        }
+        let addition = if !head.is_empty() && item.text.starts_with(head) {
+            body
+        } else {
+            text
+        };
+        let joined = format!("{}\n\n{JOINED_LINE}\n\n{addition}", item.text.trim_end());
+        if joined.len() > MAX_TEXT_BYTES {
+            return None;
+        }
+        item.text = joined;
+        Some(Joined::Appended {
+            item: item.id.clone(),
+        })
+    }
+
     /// Try again after a stall (the operator resumed it, or the session
     /// was relaunched): the stall is cleared, and so is the wait for the
     /// agent to take up the last delivered prompt, which is what stalls

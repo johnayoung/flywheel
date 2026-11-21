@@ -1333,6 +1333,45 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_messages_to_a_busy_session_is_one_prompt() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    let busy = hub.claude("busy", None, json!({})).await;
+    let other = hub.claude("other", None, json!({})).await;
+    for agent in [&lead, &busy, &other] {
+        agent.turn().await;
+    }
+    busy.hook("UserPromptSubmit", json!({"prompt": "work"}))
+        .await;
+    let said = lead
+        .ok("message_session", json!({"to": "busy", "text": "one"}))
+        .await;
+    assert!(said.starts_with("Queued for busy"), "{said}");
+    let said = lead
+        .ok("message_session", json!({"to": "busy", "text": "two"}))
+        .await;
+    assert!(said.contains("joined to your unread message"), "{said}");
+    let said = lead
+        .ok("message_session", json!({"to": "busy", "text": "two"}))
+        .await;
+    assert!(said.contains("not added again"), "{said}");
+    other
+        .ok("message_session", json!({"to": "busy", "text": "three"}))
+        .await;
+    let view = hub.queue(&busy.id).await;
+    assert_eq!(waiting(&view), ["two", "three"], "one item per sender");
+    let joined = view["items"][0]["text"].as_str().unwrap();
+    assert!(
+        joined.ends_with("one\n\n-- and then, from the same session:\n\ntwo"),
+        "{joined}"
+    );
+    assert_eq!(joined.matches("From lead").count(), 1, "{joined}");
+    // Its turn ends: the lead's burst goes in as one prompt.
+    busy.hook("Stop", json!({})).await;
+    busy.typed_has("-- and then, from the same session:").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_requested_review_starts_a_reviewer_child_at_the_head() {
     let mut hub = TestHub::start().await;
     // The workspace folder itself is the repo the lead works in.

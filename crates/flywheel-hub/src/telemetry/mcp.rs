@@ -396,7 +396,9 @@ fn message_tool() -> Value {
                         not send your final report to the session that started you: your \
                         closing message reaches it. Do not use it to reach the operator (ask_operator does that). Give a \
                         topic to one decision or request so a later change to it replaces \
-                        the earlier message instead of arriving after it.",
+                        the earlier message instead of arriving after it. Without a topic, a \
+                        message to a busy session joins your unread one there (one prompt); \
+                        a repeat of it is dropped.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -580,3 +580,69 @@ fn an_item_without_a_topic_reads_and_writes_as_before() {
             .is_none()
     );
 }
+
+fn message(id: &str, from: &str, text: &str) -> QueueItem {
+    QueueItem {
+        from: Some(from.to_owned()),
+        text: text.to_owned(),
+        ..item(id, When::Done)
+    }
+}
+
+#[test]
+fn a_senders_burst_joins_its_unread_message_once() {
+    let head = "From lead in r: a message from that agent session";
+    let mut q = queue(vec![message("a", "lead", &format!("{head}\n\nfirst"))]);
+    assert_eq!(
+        q.join_unread("lead", &format!("{head}\n\nsecond")),
+        Some(Joined::Appended { item: "a".into() })
+    );
+    assert_eq!(
+        q.items[0].text,
+        format!("{head}\n\nfirst\n\n{JOINED_LINE}\n\nsecond")
+    );
+    // An exact repeat of either part adds nothing.
+    for again in ["first", "second"] {
+        assert_eq!(
+            q.join_unread("lead", &format!("{head}\n\n{again}")),
+            Some(Joined::Repeat { item: "a".into() })
+        );
+    }
+    // A message that only contains an earlier one is not a repeat.
+    assert_eq!(
+        q.join_unread("lead", &format!("{head}\n\nfirst, then more")),
+        Some(Joined::Appended { item: "a".into() })
+    );
+    assert_eq!(q.items.len(), 1);
+    // Another header (a successor's) is kept in full.
+    q.join_unread("lead", "From lead-2 in r: x\n\nthird");
+    assert!(q.items[0].text.ends_with("From lead-2 in r: x\n\nthird"));
+}
+
+#[test]
+fn only_a_plain_unread_message_from_the_same_sender_is_joined() {
+    let text = "From s in r: m\n\nbody";
+    let mut topical = message("t", "lead", text);
+    topical.topic = Some("ruling".into());
+    let mut urgent = message("p", "lead", text);
+    urgent.priority = true;
+    let mut sent = message("d", "lead", text);
+    sent.state = ItemState::Sending { sending_at: at(1) };
+    let mut watched = message("w", "lead", text);
+    watched.watch = Some("w1".into());
+    let mut q = queue(vec![
+        topical,
+        urgent,
+        sent,
+        watched,
+        message("o", "other", text),
+        item("op", When::Done),
+    ]);
+    assert_eq!(q.join_unread("lead", "From s in r: m\n\nnew"), None);
+    // Past the size limit: queued on its own.
+    let mut big = queue(vec![message("b", "lead", &"x".repeat(MAX_TEXT_BYTES - 10))]);
+    assert_eq!(
+        big.join_unread("lead", "From s in r: m\n\nmore than ten bytes"),
+        None
+    );
+}

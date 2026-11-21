@@ -825,6 +825,38 @@ impl Hub {
                 Ok(Delivery::Pasted { paste })
             }
             Some(why) => {
+                // An agent's plain message joins its own unread one: one
+                // prompt for a burst, one item per sender.
+                if let Some(sender) = from.filter(|_| topic.is_none() && !priority) {
+                    let joined = self
+                        .store()
+                        .update_queue(id, |queue| queue.join_unread(sender, &text))?;
+                    if let Some(joined) = joined {
+                        let pending = self
+                            .store()
+                            .queue(id)
+                            .map_or(0, SessionQueue::pending_count);
+                        self.queue_changed();
+                        let (item, why) = match joined {
+                            super::Joined::Appended { item } => {
+                                let why = format!(
+                                    "joined to your unread message {}",
+                                    &item[..item.len().min(8)]
+                                );
+                                (item, why)
+                            }
+                            super::Joined::Repeat { item } => {
+                                let why = format!(
+                                    "the same text already waits in your unread message {}; not \
+                                     added again",
+                                    &item[..item.len().min(8)]
+                                );
+                                (item, why)
+                            }
+                        };
+                        return Ok(Delivery::Queued { item, why, pending });
+                    }
+                }
                 let (item, view) = self.queue_add_from(
                     id,
                     &NewItem {

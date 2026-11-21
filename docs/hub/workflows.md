@@ -151,7 +151,7 @@ Matches within `--window` (3 s), or while that prompt waits, join it (40 listed)
 
 **Stuck leases**: held past `max(3x p90, p90+10m)` (1 h, no history) while someone waits: a Needs-you hold (Release: break + SIGTERM its process group; Keep waiting), STUCK in the inspector, `lease.stuck` in waiters' logs.
 
-**Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). `request_review` starts a reviewer child in a worktree at head; its verdict is its closing message. Covered: a READY chain tip, no later NOT_READY, not by its author. Inspector: its branch's coverage.
+**Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). `request_review`: a reviewer child at head; its verdict is its closing message. Covered: a READY chain tip, no later NOT_READY, not by its author. Inspector: its branch's coverage.
 
 **Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`). Each: sent if its queue would deliver now, else queued, else refused (why). `--header` names the recipients.
 
@@ -177,7 +177,7 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 - **Close** (`end_session` `dry_run` / `close`, `fw hub close`, the Close dialog): checklist (merged?, dirty, untracked, `target/` size, sharers); `remove` only if clean and unshared (branch kept unless merged), `clean` its own `target/`, `report` kept. Rechecked after the end.
 - **Adopt** (`adopt_worktree`, `fw hub change`): a plain-git worktree tracked as if started (base from its reflog, upstream, or the repo's branch); a workspace's folded **Worktrees** line (adopt, close).
 - **While ending**: its queue is set aside (senders told); answers name what dies (its processes; MCP ones counted) and dirty work (kept).
-- **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else a Needs you **Approve** (`fw hub ends`; a succession needs none). Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`, `topic`: replaces your unread one, else starts `superseded: T`.
+- **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else a Needs you **Approve** (`fw hub ends`; a succession needs none). Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`, `topic`: replaces your unread one, else starts `superseded: T`; none: joins it.
 - **Labels**: `key=value`, one per key (`fw hub label`, `label` tool, `--label`); `--if V`/`--if-unset` claim. The hub's: `fw.kind`, `fw.parent`, `fw.change`, `fw.pr`, `fw.verified`, `fw.state` (live). Sidebar: group-by, `label:` filter.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Rows: call or thinking, its age.

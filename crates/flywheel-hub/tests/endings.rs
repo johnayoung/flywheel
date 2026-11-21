@@ -1831,6 +1831,58 @@ async fn a_replaced_leads_successor_hears_its_children() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_stopped_by_a_rate_limit_is_woken_when_it_resets() {
+    use flywheel_hub::watch::RESUME_PROMPT;
+    let mut hub = TestHub::start().await;
+    let agent = hub.claude("worker", None, json!({})).await;
+    agent.turn().await;
+    let mine = format!("/api/watches?session={}", agent.id);
+    agent
+        .hook("UserPromptSubmit", json!({"prompt": "build it"}))
+        .await;
+    agent
+        .hook(
+            "StopFailure",
+            json!({"error": "rate_limit", "error_details": "5-hour limit reached"}),
+        )
+        .await;
+    // A one-shot resume, in the fallback's 15 minutes (no window said when).
+    let deadline = Instant::now() + WAIT;
+    let watch = loop {
+        let listed = hub.get(&mine).await;
+        if let Some(w) = listed["watches"].as_array().unwrap().first() {
+            break w.clone();
+        }
+        assert!(Instant::now() < deadline, "no resume armed: {listed}");
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(watch["prompt"], RESUME_PROMPT, "{watch}");
+    let next = chrono::DateTime::parse_from_rfc3339(watch["time"]["next"].as_str().unwrap())
+        .unwrap()
+        .timestamp();
+    let ahead = next - chrono::Utc::now().timestamp();
+    assert!((14 * 60..=15 * 60).contains(&ahead), "{ahead} s: {watch}");
+    // Hit again: still one.
+    agent
+        .hook("StopFailure", json!({"error": "rate_limit"}))
+        .await;
+    assert_eq!(hub.get(&mine).await["watches"].as_array().unwrap().len(), 1);
+    // A prompt reaches it first: the resume is moot.
+    agent
+        .hook("UserPromptSubmit", json!({"prompt": "go on"}))
+        .await;
+    let deadline = Instant::now() + WAIT;
+    while !hub.get(&mine).await["watches"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the resume stayed armed");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     let mut hub = TestHub::start().await;
     let lead = hub.claude("lead", None, json!({})).await;

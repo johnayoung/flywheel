@@ -190,7 +190,17 @@ impl Hub {
         if let Ok(record) = self.store().session(session) {
             name_session(&mut drafts, SessionKind::Claude, record);
         }
+        let rate_limited = drafts
+            .iter()
+            .any(|d| matches!(d.what, What::RateLimited { .. }));
         self.telemetry.record(session, drafts);
+        // A turn stopped on a rate limit is woken when the limit resets; a
+        // prompt that reaches it first makes that moot.
+        if rate_limited {
+            self.arm_rate_limit_resume(session);
+        } else if event == "UserPromptSubmit" {
+            self.drop_rate_limit_resume(session);
+        }
         false
     }
 

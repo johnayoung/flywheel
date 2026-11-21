@@ -144,7 +144,7 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched. A prompt (queued or typed in at once) that started no turn and is not in the agent's transcript was lost on its way in: it is typed again once first |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
-**Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply). A stuck lease a child waits on: `children kind=lease` (its state does not move). Closing messages come in full; re-arming a filter replaces it.
+**Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a match queues the prompt, events, and cursors into the owner. A stuck lease a child waits on: `children kind=lease`. Closing messages come in full; re-arming a filter replaces it. A rate-limited turn is woken at its reset.
 Matches within `--window` (3 s), or while that prompt waits, join it (40 listed): 500 children finishing wake a lead once. Its own events never match; it ends with its owner. Time watches (`--at`, `--every` 5m+) fire by clock, survive restarts, and pass to the owner's successor.
 
 **Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`. An exclusive ask from inside its holder (an ancestor process) fails at once.

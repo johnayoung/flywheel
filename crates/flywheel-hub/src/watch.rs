@@ -49,6 +49,13 @@ pub const MAX_LINES: usize = 40;
 /// Most bytes of closing messages one wake carries in full; past them a
 /// finished turn is one summary line (`fw hub tail` has the rest).
 pub const MAX_ENDINGS_BYTES: usize = 12 * 1024;
+/// The prompt of the watch the hub arms when a session's turn stops on a
+/// rate limit ([`Hub::arm_rate_limit_resume`]).
+pub const RESUME_PROMPT: &str = "Your last turn stopped on a rate limit, which has now \
+     reset (the hub woke you). Carry on from where you stopped; if that work is already \
+     done, say so and end your turn.";
+/// Wait this long to resume when no rate-limit window says when it resets.
+pub const RESUME_FALLBACK_SECS: i64 = 15 * 60;
 /// The watch the hub arms for a session when it starts its first child
 /// ([`Hub::ensure_children_watch`]).
 pub const DEFAULT_CHILDREN_FILTER: &str = "children state=done|blocked|failed|asking";
@@ -551,6 +558,54 @@ impl Hub {
         };
         if let Err(e) = self.watch_add(&new, None) {
             eprintln!("fw hub: default children watch for {caller}: {e}");
+        }
+    }
+
+    /// A turn of `session` stopped on a rate limit: arm a one-shot time
+    /// watch that wakes it when the limit resets (the soonest reset among
+    /// windows at or near full, a minute after; else in
+    /// [`RESUME_FALLBACK_SECS`]), replacing one armed before. Without it
+    /// the session sits until someone prompts it. Best effort.
+    pub(crate) fn arm_rate_limit_resume(&self, session: &str) {
+        let now = Utc::now().timestamp();
+        let reset = self
+            .telemetry()
+            .snapshot(session)
+            .and_then(|snap| {
+                snap.rate
+                    .iter()
+                    .filter(|w| w.used_pct >= 95.0)
+                    .filter_map(|w| w.resets_at)
+                    .filter(|at| *at > now)
+                    .min()
+            })
+            .map_or(now + RESUME_FALLBACK_SECS, |at| at + 60);
+        self.drop_rate_limit_resume(session);
+        let Some(at) = DateTime::from_timestamp(reset, 0) else {
+            return;
+        };
+        let new = NewWatch {
+            owner: session.to_owned(),
+            prompt: RESUME_PROMPT.to_owned(),
+            at: Some(at.to_rfc3339()),
+            ..NewWatch::default()
+        };
+        match self.watch_add(&new, None) {
+            Ok(watch) => eprintln!(
+                "fw hub: {session} hit a rate limit: watch {} resumes it at {}",
+                watch.short(),
+                at.format("%H:%M UTC")
+            ),
+            Err(e) => eprintln!("fw hub: rate-limit resume for {session}: {e}"),
+        }
+    }
+
+    /// Disarm `session`'s rate-limit resume (a prompt reached it first).
+    pub(crate) fn drop_rate_limit_resume(&self, session: &str) {
+        for watch in self.watches(Some(session)) {
+            if watch.time.is_some() && watch.prompt == RESUME_PROMPT {
+                let _ = self.watch_remove(&watch.id);
+            }
         }
     }
 

@@ -1785,6 +1785,52 @@ async fn a_worktree_made_with_plain_git_is_adopted_and_closed_by_the_rules() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_leads_successor_hears_its_children() {
+    let mut hub = TestHub::start().await;
+    let top = hub.claude("top", None, json!({})).await;
+    hub.policy(&top, "allowed").await;
+    let lead = hub.claude("lead", Some(&top), json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let kid = hub.claude("kid", Some(&lead), json!({})).await;
+    for agent in [&top, &lead, &kid] {
+        agent.turn().await;
+    }
+    let mine = |id: &str| format!("/api/watches?session={id}");
+    assert_eq!(
+        hub.get(&mine(&lead.id)).await["watches"][0]["filter"]["children"],
+        lead.id.as_str()
+    );
+    kid.hook("UserPromptSubmit", json!({"prompt": "work"}))
+        .await;
+    top.ok(
+        "replace_session",
+        json!({"to": "lead", "name": "lead-2", "prompt": "Carry on.", "final_prompt": "Wrap up."}),
+    )
+    .await;
+    lead.typed_has("Wrap up.").await;
+    lead.turn().await;
+    hub.ended(&lead.id).await;
+    let next = hub.named("lead-2").await.expect("the successor started");
+    let next = hub.agent(&next);
+    next.env(None).await;
+    next.turn().await;
+    // The successor watches the children it took over.
+    let watches = hub.get(&mine(&next.id)).await;
+    assert_eq!(
+        watches["watches"][0]["filter"]["children"],
+        next.id.as_str(),
+        "{watches}"
+    );
+    // The child's report reaches it.
+    kid.hook(
+        "Stop",
+        json!({"last_assistant_message": "Outcome: done, branch kid at abc"}),
+    )
+    .await;
+    next.typed_has("Outcome: done, branch kid at abc").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     let mut hub = TestHub::start().await;
     let lead = hub.claude("lead", None, json!({})).await;

@@ -651,13 +651,13 @@ impl Hub {
                     })
                 })
         };
-        if let Some(to) = successor {
-            match self.store().move_time_watches(owner, &to, MAX_PER_OWNER) {
+        if let Some(to) = &successor {
+            match self.store().move_time_watches(owner, to, MAX_PER_OWNER) {
                 Ok(moved) => {
                     for watch in &moved {
                         self.log_hub_event(
                             "watch.moved",
-                            Some(&to),
+                            Some(to),
                             serde_json::json!({ "watch": watch.id, "from": owner, "to": to }),
                         );
                     }
@@ -672,6 +672,14 @@ impl Hub {
                 return;
             }
         };
+        // Its children pass to its successor (their owner is followed
+        // through successors), and they report by ending their turns: the
+        // successor watches them, or it would never hear them.
+        if let Some(to) = &successor
+            && removed.iter().any(|w| w.filter.children.is_some())
+        {
+            self.ensure_children_watch(to);
+        }
         if !removed.is_empty() {
             let ids: Vec<String> = removed.iter().map(|w| w.id.clone()).collect();
             eprintln!("fw hub: {} watch(es) of {owner} ended with it", ids.len());

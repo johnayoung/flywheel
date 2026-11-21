@@ -908,6 +908,10 @@ impl Hub {
             .is_ok_and(|r| r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()));
         let _ = self.store().mark_exited(id, exit);
         if !stopping && !relaunching {
+            // Its children pass to its successor (or up its chain) now that
+            // it is gone: their `fw.parent` says so before any watch on
+            // them is handed on.
+            self.refresh_parents();
             self.drop_watches_of(id);
             self.drop_leases_of(id);
         }

@@ -63,6 +63,8 @@ pub const LEASE_TOOL: &str = "lease";
 /// The review record tools' names on the server.
 pub const RECORD_REVIEW_TOOL: &str = "record_review";
 pub const CHECK_REVIEWED_TOOL: &str = "check_reviewed";
+/// The tool that starts a reviewer for a commit range.
+pub const REQUEST_REVIEW_TOOL: &str = "request_review";
 /// The adopt tool's name on the server.
 pub const ADOPT_TOOL: &str = "adopt_worktree";
 
@@ -169,6 +171,11 @@ pub trait Host {
     fn lease(&self, args: &LeaseArgs) -> Result<String, String>;
     /// Record a review the caller made (or ran).
     fn record_review(&self, input: &crate::hub::reviews::ReviewInput) -> Result<String, String>;
+    /// Start a reviewer for a commit range as the caller's child.
+    fn request_review(
+        &self,
+        request: &crate::hub::reviews::ReviewRequest,
+    ) -> Result<String, String>;
     /// Whether every commit of `range` in `repo` is covered by a READY
     /// review.
     fn check_reviewed(
@@ -746,6 +753,29 @@ fn adopt_tool() -> Value {
     })
 }
 
+fn request_review_tool() -> Value {
+    json!({
+        "name": REQUEST_REVIEW_TOOL,
+        "title": "Request a review",
+        "description": "Have a fresh reviewer session check a commit range instead of reading \
+                        the diff yourself. The hub starts it as your child in a new worktree \
+                        at head; it reviews read-only, records its verdict (record_review), and \
+                        ends its turn with the verdict and findings, which arrive through your \
+                        children watch. Then check_reviewed confirms coverage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Optional: a path inside one of your repos. Default: your directory." },
+                "base": { "type": "string", "description": "The commit the range starts after (SHA or ref)." },
+                "head": { "type": "string", "description": "The last commit to review (SHA or ref, e.g. a child's branch)." },
+                "focus": { "type": "string", "description": "Optional: what the change claims and what to check hardest (the author's report)." },
+                "name": { "type": "string", "description": "Optional: the reviewer's name. Default: review-<head>." }
+            },
+            "required": ["base", "head"]
+        }
+    })
+}
+
 fn check_reviewed_tool() -> Value {
     json!({
         "name": CHECK_REVIEWED_TOOL,
@@ -848,6 +878,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 unwatch_tool(),
                 lease_tool(),
                 record_review_tool(),
+                request_review_tool(),
                 check_reviewed_tool(),
                 adopt_tool(),
             ] })),
@@ -1048,6 +1079,16 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         Err(why) => text_result(format!("Not recorded: {why}"), true),
                     },
                 })
+            } else if name == Some(REQUEST_REVIEW_TOOL) {
+                let request: Result<crate::hub::reviews::ReviewRequest, _> =
+                    serde_json::from_value(args.clone());
+                Ok(match request {
+                    Err(e) => text_result(format!("No reviewer started: {e}"), true),
+                    Ok(request) => match host.request_review(&request) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("No reviewer started: {why}"), true),
+                    },
+                })
             } else if name == Some(ADOPT_TOOL) {
                 let given = |key: &str| {
                     Some(arg(key).trim())
@@ -1216,6 +1257,12 @@ mod tests {
         }
         fn lease(&self, args: &LeaseArgs) -> Result<String, String> {
             Ok(format!("{} {:?}", args.action, args.resource))
+        }
+        fn request_review(
+            &self,
+            request: &crate::hub::reviews::ReviewRequest,
+        ) -> Result<String, String> {
+            Ok(format!("Reviewer on {}..{}", request.base, request.head))
         }
         fn record_review(
             &self,
@@ -1454,6 +1501,7 @@ mod tests {
                 UNWATCH_TOOL,
                 LEASE_TOOL,
                 RECORD_REVIEW_TOOL,
+                REQUEST_REVIEW_TOOL,
                 CHECK_REVIEWED_TOOL,
                 ADOPT_TOOL
             ]

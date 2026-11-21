@@ -1333,6 +1333,59 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_review_starts_a_reviewer_child_at_the_head() {
+    let mut hub = TestHub::start().await;
+    // The workspace folder itself is the repo the lead works in.
+    let repo = hub.root.join("repo");
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let mut shas = Vec::new();
+    for n in 0..3 {
+        std::fs::write(repo.join("f"), format!("{n}\n")).unwrap();
+        git(&repo, &["add", "f"]);
+        git(&repo, &["commit", "-q", "-m", &format!("c{n}")]);
+        shas.push(git(&repo, &["rev-parse", "HEAD"]));
+    }
+    let lead = hub.claude("lead", None, json!({})).await;
+    lead.turn().await;
+    hub.policy(&lead, "allowed").await;
+
+    // Not a range: refused, nothing started.
+    let (error, said) = lead
+        .tool("request_review", json!({"base": shas[2], "head": shas[0]}))
+        .await;
+    assert!(error && said.contains("not an ancestor"), "{said}");
+
+    let said = lead
+        .ok(
+            "request_review",
+            json!({"base": shas[0], "head": "main", "focus": "f counts up"}),
+        )
+        .await;
+    let short = &shas[2][..8];
+    assert!(
+        said.starts_with(&format!("Started reviewer review-{short} (id ")),
+        "{said}"
+    );
+    assert!(said.contains("(2 commits)"), "{said}");
+    let reviewer = hub
+        .named(&format!("review-{short}"))
+        .await
+        .expect("the reviewer session");
+    assert_eq!(reviewer["opened_by"], lead.id.as_str(), "{reviewer}");
+    // Its worktree is checked out at the head under review.
+    let dir = PathBuf::from(reviewer["worktree"]["path"].as_str().unwrap());
+    assert_eq!(git(&dir, &["rev-parse", "HEAD"]), shas[2]);
+    // Its verdict comes back through the lead's children watch.
+    let watches = hub.get(&format!("/api/watches?session={}", lead.id)).await;
+    assert_eq!(
+        watches["watches"][0]["filter"]["children"],
+        lead.id.as_str(),
+        "{watches}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reviews_are_recorded_by_sha_and_coverage_says_what_is_missing() {
     let mut hub = TestHub::start().await;
     let proj = hub.root.join("repo/proj");

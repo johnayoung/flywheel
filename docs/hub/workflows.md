@@ -151,7 +151,7 @@ Matches within `--window` (3 s), or while that prompt waits, join it (40 listed)
 
 **Stuck leases**: held past `max(3x p90, p90+10m)` (1 h, no history) while someone waits: a Needs-you hold (Release: break + SIGTERM its process group; Keep waiting), STUCK in the inspector, `lease.stuck` in waiters' logs.
 
-**Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). Covered: a READY chain tip, no later NOT_READY, not by its author. Inspector: its branch's coverage.
+**Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). `request_review` starts a reviewer child in a worktree at head; its verdict is its closing message. Covered: a READY chain tip, no later NOT_READY, not by its author. Inspector: its branch's coverage.
 
 **Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`). Each: sent if its queue would deliver now, else queued, else refused (why). `--header` names the recipients.
 

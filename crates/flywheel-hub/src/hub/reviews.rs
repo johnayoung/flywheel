@@ -386,6 +386,143 @@ impl Hub {
     }
 }
 
+/// A review an agent asks for (the `request_review` tool).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ReviewRequest {
+    /// Any path inside one of the caller's repos (default: its directory).
+    #[serde(default)]
+    pub repo: String,
+    pub base: String,
+    pub head: String,
+    /// What the change claims to do, and what to check hardest.
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// The reviewer session's name (default `review-<head>`).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl Hub {
+    /// The `request_review` agent tool: start a reviewer for `base..head`
+    /// as `caller`'s child, in a fresh worktree at `head`, told to record
+    /// its verdict and end its turn with it, so `caller` reads the verdict
+    /// (through its children watch) and never the diff.
+    pub fn agent_request_review(
+        self: &std::sync::Arc<Self>,
+        caller: &str,
+        request: &ReviewRequest,
+    ) -> Result<String, HubError> {
+        let record = self.store().session(caller)?.clone();
+        let (dir, common) = self.review_repo(Some(&record), &request.repo)?;
+        let base = git::commit_id(&dir, &request.base).map_err(StateError::Invalid)?;
+        let head = git::commit_id(&dir, &request.head).map_err(StateError::Invalid)?;
+        if base == head || !git::is_ancestor(&dir, &base, &head) {
+            return Err(StateError::Invalid(format!(
+                "{} is not an ancestor of {}: a review covers base..head",
+                &base[..12],
+                &head[..12]
+            ))
+            .into());
+        }
+        let commits = git::range_commits(&dir, &base, &head, crate::reviews::MAX_COMMITS)
+            .map_err(StateError::Invalid)?
+            .len();
+        let author = self
+            .review_author(&common, &head)
+            .and_then(|id| self.store().session(&id).ok().map(|s| s.name.clone()));
+        // The reviewer's worktree is cut in the workspace folder holding
+        // this repo (the caller's own when that is it).
+        let workspace = self.workspace(&record.workspace_id)?;
+        let own = git::common_dir(&record.cwd).ok();
+        let folder = (own.as_deref() != Some(common.as_path()))
+            .then(|| {
+                workspace
+                    .folders
+                    .iter()
+                    .find(|f| git::common_dir(&f.path).ok().as_deref() == Some(common.as_path()))
+            })
+            .flatten()
+            .map(|f| f.path.clone());
+        let short = &head[..8];
+        let name = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map_or_else(|| format!("review-{short}"), str::to_owned);
+        let task = format!("review-{short}-{}", &new_id()[..4]);
+        let prompt = review_prompt(
+            &base,
+            &head,
+            commits,
+            author.as_deref(),
+            request.focus.as_deref(),
+        );
+        let opened = self.agent_start(
+            caller,
+            super::AgentStart {
+                name,
+                prompt,
+                folder,
+                worktree: Some(crate::state::WorktreeRequest {
+                    task,
+                    base: Some(head.clone()),
+                }),
+                model: None,
+            },
+        )?;
+        let range = format!("{}..{}", &base[..12], &head[..12]);
+        Ok(match opened {
+            super::Opened::Started(view) => format!(
+                "Started reviewer {} (id {}) on {range} ({commits} commit{}). Its verdict \
+                 arrives as its closing message through your children watch; do not read the \
+                 diff yourself. check_reviewed {range} confirms coverage once it records.",
+                view.record.name,
+                view.record.id,
+                if commits == 1 { "" } else { "s" },
+            ),
+            super::Opened::Waiting { request, .. } => format!(
+                "The reviewer on {range} waits for the operator's approval (request {}); \
+                 keep working.",
+                request.id
+            ),
+        })
+    }
+}
+
+/// A reviewer's first prompt for `base..head`.
+fn review_prompt(
+    base: &str,
+    head: &str,
+    commits: usize,
+    author: Option<&str>,
+    focus: Option<&str>,
+) -> String {
+    let by = author.map_or_else(String::new, |a| format!(" by {a}"));
+    let focus = focus
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map_or_else(String::new, |f| {
+            format!("\n\nWhat it claims, and what to check hardest:\n{f}")
+        });
+    format!(
+        "Review {commits} commit{s} {base}..{head}{by}. Your worktree is checked out at the head; \
+         you are the reviewer, not the author: do not edit, commit, or push.{focus}\n\n\
+         1. Read the change: git log --oneline {base}..{head}; git diff {base}..{head}.\n\
+         2. Check it does what it claims, and look for correctness bugs, missing or weak \
+         tests, and broken project rules (CLAUDE.md). Run the targeted tests or commands that \
+         prove or disprove a finding; do not run a full suite unless the change needs it.\n\
+         3. Write the full review to a file outside the repo (/tmp/review-{short}.md) and call \
+         mcp__flywheel__record_review with base {base}, head {head}, verdict READY, \
+         READY_WITH_CHANGES, or NOT_READY, findings counted by severity, and that report.\n\
+         4. End your turn with the verdict on the first line, then each finding that matters \
+         with file:line and why, at most ~1500 characters in all. That closing message is all \
+         your starter reads.",
+        s = if commits == 1 { "" } else { "s" },
+        short = &head[..8],
+    )
+}
+
 /// Coverage in words.
 pub fn coverage_text(coverage: &Coverage) -> String {
     use crate::reviews::Uncovered;
@@ -429,4 +566,32 @@ pub fn coverage_text(coverage: &Coverage) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::review_prompt;
+
+    #[test]
+    fn a_reviewer_is_told_the_range_to_stay_read_only_record_and_end_with_its_verdict() {
+        let (base, head) = ("a".repeat(40), "b".repeat(40));
+        let prompt = review_prompt(&base, &head, 2, Some("c1"), Some("adds X"));
+        assert!(
+            prompt.starts_with(&format!("Review 2 commits {base}..{head} by c1.")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("do not edit, commit, or push"), "{prompt}");
+        assert!(prompt.contains("check hardest:\nadds X"), "{prompt}");
+        assert!(
+            prompt.contains("mcp__flywheel__record_review with base"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("verdict on the first line"), "{prompt}");
+        assert!(prompt.contains("/tmp/review-bbbbbbbb.md"), "{prompt}");
+        let bare = review_prompt(&base, &head, 1, None, None);
+        assert!(
+            bare.starts_with(&format!("Review 1 commit {base}..{head}. ")),
+            "{bare}"
+        );
+    }
 }

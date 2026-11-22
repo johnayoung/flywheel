@@ -23,11 +23,12 @@ cargo install --path crates/flywheel # optional: put flywheel + fw on PATH
 ## Running tests
 
 Unit tests live in-module (`#[cfg(test)]`); integration tests in
-`crates/<name>/tests/`. Docker-backed tests (Postgres, container backend) skip
+`crates/<name>/tests/`, mostly as modules of one `tests/it/main.rs` binary per
+crate (add a `mod` there rather than a new top-level file). Docker-backed tests (Postgres, container backend) skip
 themselves when no Docker daemon is reachable.
 
 ```bash
-cargo test -p flywheel-core --test module_purity   # one integration-test file (iterating)
+cargo test -p flywheel-core --test it module_purity   # one integration-test module (iterating)
 cargo test -p flywheel-core harness                # one crate, one name filter (iterating)
 cargo test -p flywheel-core -- --nocapture         # show test output (iterating)
 ```

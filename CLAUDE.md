@@ -54,14 +54,14 @@ New feature work is specced in the project's central specs dir (`fw project path
 ```bash
 scripts/check.sh                                  # gate: rustfmt -> clippy -D warnings -> tests scoped to what changed, quiet on success
 CHECK_FULL=1 scripts/check.sh                     # every test (before a release)
-cargo test -p flywheel-core --test module_purity  # one integration-test file (iterating)
+cargo test -p flywheel-core --test it module_purity  # one integration-test module (iterating)
 cargo test -p flywheel-core harness               # one crate, one name filter (iterating)
 cargo test -p flywheel-core -- --nocapture        # show test output (iterating)
 cargo build --release -p flywheel                 # target/release/{flywheel,fw}
 cargo install --path crates/flywheel              # install flywheel + fw from this checkout
 ```
 
-Stable Rust, `rust-version` 1.91, edition 2024. Unit tests live in-module (`#[cfg(test)]`); integration tests in `crates/<name>/tests/`. Docker-backed tests (Postgres, container backend) skip themselves without a daemon.
+Stable Rust, `rust-version` 1.91, edition 2024. Unit tests live in-module (`#[cfg(test)]`); integration tests in `crates/<name>/tests/`, mostly as modules of one `tests/it/main.rs` binary per crate (add a `mod` there, not a new top-level file: each file is another link step). Docker-backed tests (Postgres, container backend) skip themselves without a daemon.
 
 **Run the full suite through `scripts/check.sh`, not bare `cargo test`.** It wraps each gate in `scripts/run_silent.sh` (context-efficient backpressure): output is suppressed on success — one `ok` line per gate — and dumped in full only on the first failure. Use the bare `cargo test` forms above only while iterating; set `RUN_SILENT_VERBOSE=1` to stream output live. Run any other verification command the same way: `scripts/run_silent.sh "<desc>" <command>`.
 
@@ -76,7 +76,7 @@ The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides la
 
 ## Non-negotiable invariants
 
-- **IMPORTANT: `task.rs`, `lifecycle.rs`, and `envelope.rs` in `flywheel-core` are pure.** No `std::fs`/`std::io`/`std::env`/`std::process`/`std::net`/`tokio::`/`File::`/`read_to_string`. Enforced by `crates/flywheel-core/tests/module_purity.rs`. Do not weaken the test to make a feature fit — move file/JSON code into `crates/flywheel-core/src/loaders.rs` instead.
+- **IMPORTANT: `task.rs`, `lifecycle.rs`, and `envelope.rs` in `flywheel-core` are pure.** No `std::fs`/`std::io`/`std::env`/`std::process`/`std::net`/`tokio::`/`File::`/`read_to_string`. Enforced by `crates/flywheel-core/tests/it/module_purity.rs`. Do not weaken the test to make a feature fit — move file/JSON code into `crates/flywheel-core/src/loaders.rs` instead.
 - **IMPORTANT: `Task` is input-source agnostic.** Direct struct construction (`Task::new`) is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source.
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.

@@ -237,6 +237,22 @@ impl TestHub {
         assert_eq!(status, StatusCode::OK, "{view}");
     }
 
+    /// Wait until session `sid` is off the hub (ended and removed, as a
+    /// session its starter ends or replaces is).
+    async fn gone(&self, sid: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (status, view) = self
+                .call(reqwest::Method::GET, &format!("/api/sessions/{sid}"), None)
+                .await;
+            if status == StatusCode::NOT_FOUND {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sid} stayed on the hub: {view}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Wait until session `sid` ended; its view.
     async fn ended(&self, sid: &str) -> Value {
         let deadline = Instant::now() + WAIT;
@@ -1811,7 +1827,8 @@ async fn a_replaced_leads_successor_hears_its_children() {
     .await;
     lead.typed_has("Wrap up.").await;
     lead.turn().await;
-    hub.ended(&lead.id).await;
+    // Its starter replaced it: it ends and leaves the hub.
+    hub.gone(&lead.id).await;
     let next = hub.named("lead-2").await.expect("the successor started");
     let next = hub.agent(&next);
     next.env(None).await;
@@ -2041,7 +2058,7 @@ async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
     .await;
     old.typed_has("Wrap up.").await;
     old.turn().await;
-    hub.ended(&old.id).await;
+    hub.gone(&old.id).await;
     let new = hub.named("new").await.expect("the successor started");
     let deadline = Instant::now() + WAIT;
     loop {
@@ -2109,6 +2126,9 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     hub.told(&stranger, &format!("declined your end request {request}"))
         .await;
+    // It takes that message up, as an agent does (an end at rest waits for
+    // the turn a delivered prompt starts).
+    stranger.turn().await;
     assert!(hub.session(&worker.id).await["ending"].is_null());
 
     // An operator-started session: only ever with approval. Approved, it

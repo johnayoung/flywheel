@@ -279,6 +279,18 @@ impl Scan {
     }
 }
 
+/// Whether the process at `dir` is gone, a zombie, or dead (`Z`/`X` in
+/// its `stat`): it holds no files, no directory, no mounts.
+fn exited(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state == "Z" || state == "X"),
+        Err(e) => matches!(fail(&e, dir), Fail::Gone),
+    }
+}
+
 /// One process: what it uses and whether it was opaque; `None` when it
 /// is gone (or is a kernel thread with nothing of its own).
 fn scan_pid(
@@ -312,6 +324,8 @@ fn scan_pid(
                 }
             }
         }
+        // A zombie (or a process exiting) has no namespaces left: EINVAL.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && exited(dir) => return Ok(None),
         Err(e) => match fail(&e, &dir.join("mountinfo")) {
             Fail::Gone => return Ok(None),
             Fail::Denied => {
@@ -465,6 +479,58 @@ mod tests {
             ..bind
         };
         assert_eq!(source_here(&elsewhere, &own), None);
+    }
+
+    #[test]
+    fn a_zombie_leaves_the_scan_certain() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        // Exited, not yet waited for: a zombie.
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !exited(&PathBuf::from(format!("/proc/{pid}"))) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let scan = Scan::take();
+        assert_eq!(scan.uncertain(), None);
+        let mut child = child;
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_inspected_is_seen_by_its_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let inside = root.join("w");
+        std::fs::create_dir_all(&inside).unwrap();
+        // Non-dumpable: its cwd and fds are closed to this user.
+        let Ok(mut child) = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes,time; ctypes.CDLL(None).prctl(4,0,0,0,0); time.sleep(30)",
+            ])
+            .arg(inside.join("data.bin"))
+            .spawn()
+        else {
+            eprintln!("skipped: no python3");
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let found = loop {
+            let scan = Scan::take();
+            let found = scan.user_of(&inside).unwrap();
+            if found.as_ref().is_some_and(|u| u.how == How::Arg)
+                || std::time::Instant::now() > deadline
+            {
+                assert!(scan.opaque() > 0);
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let found = found.expect("its command line names the directory");
+        assert_eq!((found.pid, found.how), (child.id(), How::Arg));
     }
 
     #[test]

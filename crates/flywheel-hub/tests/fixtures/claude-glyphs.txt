@@ -2,7 +2,7 @@
 # sessions: splash, trust dialog, turns with edits/diffs, Bash permission
 # prompts, AskUserQuestion (wrapped), markdown tables, spinners, mode
 # footers, plan mode and its approval prompt (recordings' output events
-# plus screens; tests/glyphs.rs).
+# plus screens; tests/it/glyphs.rs).
 U+00A0   NO-BREAK SPACE
 U+00B7 · MIDDLE DOT
 U+00E9 é LATIN SMALL LETTER E WITH ACUTE

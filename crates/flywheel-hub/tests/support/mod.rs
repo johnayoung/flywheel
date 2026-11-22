@@ -4,7 +4,7 @@
 
 mod script;
 
-#[allow(unused_imports)] // tests/remote.rs runs no stand-in scripts
+#[allow(unused_imports)] // tests/it/remote.rs runs no stand-in scripts
 pub use script::write_script;
 
 use flywheel_hub::{Hub, HubError, HubOptions};

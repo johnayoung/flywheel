@@ -1,6 +1,6 @@
 //! What gh says, parsed; problems sorted; logs tidied and redacted; the
 //! events a change makes. The hub end to end (a scripted `gh`, a real
-//! server): `tests/pr.rs`.
+//! server): `tests/it/pr.rs`.
 
 use super::gh::{Gh, MergeMethods, classify, log_args, plain, tail, tidy_log};
 use super::watch::{Snap, transitions};

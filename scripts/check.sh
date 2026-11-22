@@ -21,7 +21,12 @@ cd "$REPO_ROOT"
 # cargo-nextest runs test binaries in parallel (one process per test); it
 # does not run doctests, so those get their own step. Without nextest the
 # plain `cargo test` covers both.
+#
+# Agent sessions may cap test threads (RUST_TEST_THREADS / NEXTEST_TEST_THREADS)
+# so parallel suites do not swamp the machine. This suite runs alone under the
+# lock below, so it takes every core.
 run_tests() {
+  unset RUST_TEST_THREADS NEXTEST_TEST_THREADS
   if cargo nextest --version >/dev/null 2>&1; then
     scripts/run_silent.sh "cargo test" cargo nextest run --workspace --no-fail-fast
     scripts/run_silent.sh "doctests"   cargo test --workspace --doc

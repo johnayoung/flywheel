@@ -457,14 +457,14 @@ Later (consolidated backlog): the codex JSON-RPC app-server transport (§ 16 pha
 
 ## 17. Testing strategy
 
-- **Contract tests** every adapter must pass (`tests/contract_claude.rs`, `tests/contract_codex.rs`): start emits `session.started`; a prompt produces events; completion emits `session.finished`; cancel kills the tree; unknown native events surface as `raw`; stderr is captured; cwd and environment policy are respected; unsupported capabilities and transports fail explicitly.
+- **Contract tests** every adapter must pass (`tests/it/contract_claude.rs`, `tests/it/contract_codex.rs`): start emits `session.started`; a prompt produces events; completion emits `session.finished`; cancel kills the tree; unknown native events surface as `raw`; stderr is captured; cwd and environment policy are respected; unsupported capabilities and transports fail explicitly.
 - **Fake agents** — scripted test executables (`tests/common/mod.rs`: `fake_claude`, `fake_codex`) emulating JSONL output, delays, malformed JSON, native session ids, crashes, hangs, and control traffic. CI never depends on real vendor CLIs.
-- **Fixtures** — normalizers, plan builders, and the fold are tested offline (`tests/claude_normalizer.rs`, `tests/codex_normalizer.rs`, `tests/claude_plan.rs`). Recording sanitized transcripts from real runs is the stronger future form.
+- **Fixtures** — normalizers, plan builders, and the fold are tested offline (`tests/it/claude_normalizer.rs`, `tests/it/codex_normalizer.rs`, `tests/it/claude_plan.rs`). Recording sanitized transcripts from real runs is the stronger future form.
 - **Real integration tests** — conditional on installed infrastructure; never mandatory in CI. Docker-backed tests skip without a daemon; a conditional real-`claude` run is future work.
 
 ## 18. Acceptance criteria
 
-An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance. **Holds:** proven by the branch-free agent-swap test (`agent_swap_changes_only_agent_id`, `crates/flywheel-agents/tests/contract_codex.rs`) and by live worker-stack dogfood runs of both agents landing verified tasks (2026-07-10).
+An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance. **Holds:** proven by the branch-free agent-swap test (`agent_swap_changes_only_agent_id`, `crates/flywheel-agents/tests/it/contract_codex.rs`) and by live worker-stack dogfood runs of both agents landing verified tasks (2026-07-10).
 
 Flywheel-specific (all hold):
 

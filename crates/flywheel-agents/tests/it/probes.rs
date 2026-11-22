@@ -1,8 +1,6 @@
 //! Installation/authentication probes against a temp PATH holding a fake
 //! executable and a temp HOME, so no real credentials are inspected.
 
-mod common;
-
 use flywheel_agents::claude_code::probe_claude_code_in;
 use flywheel_agents::codex::probe_codex_in;
 use flywheel_agents::{AssuranceLevel, AuthenticationKind, ProbeEnvironment};

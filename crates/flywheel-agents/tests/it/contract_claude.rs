@@ -3,7 +3,7 @@
 //! fake vendor CLI end to end (real subprocess, real stream-json parsing,
 //! real fold, real control protocol). No vendor CLI required.
 
-mod common;
+use crate::common;
 
 use common::{ScenarioBuilder, fake_claude, read_pid_file, wait_dead};
 use flywheel_agents::{

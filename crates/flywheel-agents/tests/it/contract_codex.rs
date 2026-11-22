@@ -1,7 +1,7 @@
 //! Codex adapter contract suite through the real stack plus `build_cli_plan`
 //! flag mapping, and the design-doc section 18 agent-swap acceptance test.
 
-mod common;
+use crate::common;
 
 use common::{ScenarioBuilder, fake_claude, fake_codex};
 use flywheel_agents::codex::build_cli_plan;

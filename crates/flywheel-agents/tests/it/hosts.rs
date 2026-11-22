@@ -3,7 +3,7 @@
 //! standing in for the docker client so a real spawn prints the assembled
 //! argv back.
 
-mod common;
+use crate::common;
 
 use common::write_script;
 #[cfg(unix)]

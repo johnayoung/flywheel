@@ -4,7 +4,7 @@
 //! alongside it.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use common::{process_dead, read_pid_file, wait_dead};
 use flywheel_agents::process_groups::{self, GroupRegistration};

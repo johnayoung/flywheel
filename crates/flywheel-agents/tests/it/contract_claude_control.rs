@@ -5,7 +5,7 @@
 //! closed, and how the configured timeouts bound a run. Pinned by a
 //! mutation survey of the adapter.
 
-mod common;
+use crate::common;
 
 use common::{ScenarioBuilder, fake_claude};
 use flywheel_agents::{

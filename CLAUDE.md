@@ -64,6 +64,11 @@ Stable Rust, `rust-version` 1.91, edition 2024. Unit tests live in-module (`#[cf
 
 **Run the full suite through `scripts/check.sh`, not bare `cargo test`.** It wraps each gate in `scripts/run_silent.sh` (context-efficient backpressure): output is suppressed on success — one `ok` line per gate — and dumped in full only on the first failure. Use the bare `cargo test` forms above only while iterating; set `RUN_SILENT_VERBOSE=1` to stream output live. Run any other verification command the same way: `scripts/run_silent.sh "<desc>" <command>`.
 
+**Many agents share this machine's CPU.** While iterating:
+- `cargo check -p <crate>` / `cargo clippy -p <crate> --all-targets`; `cargo build` only when you need a binary to run, never `--release` unless the task asks.
+- Scope to the crate you changed (`-p`) and filter tests to your change; `scripts/check.sh` once, at the end.
+- Do not add, remove, or upgrade dependencies (or touch `Cargo.lock`) without asking; never run `cargo clean`, `cargo update`, or change Cargo/rustc config.
+
 ## Reading large modules
 
 The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides language-server-backed symbol retrieval. For any file over ~800 lines — e.g. `crates/flywheel-orchestrator/src/autopilot.rs`, `crates/flywheel-core/src/workflow.rs`, `crates/flywheel-worktree/src/submitter.rs`, `crates/flywheel-worktree/src/daemon.rs`, `crates/flywheel-orchestrator/src/policy.rs`, `crates/flywheel-orchestrator/src/claims.rs` — use `get_symbols_overview` to map it, then `find_symbol` to pull only the target symbol and `find_referencing_symbols` for its callers. Do not `Read` a whole large module to make a localized edit: whole-file reads of these modules are the dominant per-task context cost, and reading one repeatedly across an iteration is what triggers auto-compaction.

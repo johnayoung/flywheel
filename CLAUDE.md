@@ -52,7 +52,8 @@ New feature work is specced in the project's central specs dir (`fw project path
 ## Commands
 
 ```bash
-scripts/check.sh                                  # full gate: rustfmt -> clippy -D warnings -> cargo test, quiet on success
+scripts/check.sh                                  # gate: rustfmt -> clippy -D warnings -> tests scoped to what changed, quiet on success
+CHECK_FULL=1 scripts/check.sh                     # every test (before a release)
 cargo test -p flywheel-core --test module_purity  # one integration-test file (iterating)
 cargo test -p flywheel-core harness               # one crate, one name filter (iterating)
 cargo test -p flywheel-core -- --nocapture        # show test output (iterating)

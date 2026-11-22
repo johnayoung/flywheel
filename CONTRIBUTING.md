@@ -34,7 +34,7 @@ cargo test -p flywheel-core -- --nocapture         # show test output (iterating
 
 ## The gate
 
-`scripts/check.sh` gates every change on rustfmt, clippy (`-D warnings`), and the test suite; there is no hosted CI.
+`scripts/check.sh` gates every change on rustfmt, clippy (`-D warnings`), and the tests of the crates changed since `origin/main` plus their dependents (`CHECK_FULL=1` runs every test; do that before a release); there is no hosted CI.
 Run all three before opening a PR:
 
 ```bash

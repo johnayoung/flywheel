@@ -7,7 +7,17 @@
 # done and before pushing to main.
 #
 # Usage:
-#   scripts/check.sh
+#   scripts/check.sh               # tests scoped to what changed since origin/main
+#   CHECK_FULL=1 scripts/check.sh  # every test (before a release)
+#
+# Scoped tests: the crates changed since origin/main (committed, staged,
+# unstaged, untracked) and every crate that depends on them; docs/ counts as
+# flywheel-hub (its docs-drift test, and flywheel embeds docs). The serial
+# self-update tests (~4 min alone) run only when self-update code or the
+# flywheel test support changed. Anything else that can change a build
+# (Cargo.toml/lock, toolchain, .config, scripts) runs everything, as does a
+# tree with no changes or no origin/main. Root docs and .github/.claude run
+# no tests. fmt and clippy always cover the whole workspace.
 #
 # Set RUN_SILENT_VERBOSE=1 to stream each gate's output live. Docker-backed
 # tests (Postgres, container backend) skip themselves when no daemon is
@@ -24,10 +34,54 @@ cd "$REPO_ROOT"
 # Agent sessions may cap test threads (RUST_TEST_THREADS / NEXTEST_TEST_THREADS)
 # so parallel suites do not swamp the machine. This suite runs alone under the
 # lock below, so it takes every core.
+#
+# scope_tests sets test_filter (a nextest filterset; empty = every test,
+# "none" = no tests) and scope_note (what runs, for the log line).
+scope_tests() {
+  test_filter="" scope_note="all tests"
+  if [[ "${CHECK_FULL:-0}" == 1 ]]; then scope_note="all tests (CHECK_FULL=1)"; return; fi
+  local base changed f c self_update=0 crates=()
+  if ! base=$(git merge-base HEAD origin/main 2>/dev/null); then
+    scope_note="all tests (no origin/main to diff against)"; return
+  fi
+  changed=$({ git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
+  if [[ -z "$changed" ]]; then scope_note="all tests (no changes since origin/main)"; return; fi
+  while IFS= read -r f; do
+    case "$f" in
+      crates/flywheel/src/self_update/* | crates/flywheel/tests/self_update* | crates/flywheel/tests/support/*)
+        self_update=1 ;;&
+      crates/*/*) c=${f#crates/}; c=${c%%/*} ;;
+      docs/*) c=flywheel-hub ;;
+      *.md | LICENSE | .github/* | .claude/* | .gitignore | .gitattributes | .mcp.json | examples/*) continue ;;
+      *) scope_note="all tests ($f changed)"; return ;;
+    esac
+    if [[ ! -f "crates/$c/Cargo.toml" ]]; then scope_note="all tests ($f changed)"; return; fi
+    [[ " ${crates[*]} " == *" $c "* ]] || crates+=("$c")
+  done <<<"$changed"
+  if ((${#crates[@]} == 0)); then
+    test_filter=none scope_note="no tests (no crate changed since origin/main)"; return
+  fi
+  for c in "${crates[@]}"; do test_filter+="${test_filter:+ | }rdeps(=$c)"; done
+  test_filter="($test_filter)"
+  scope_note="${crates[*]} and their dependents"
+  if ((self_update)); then
+    scope_note+=", self-update included"
+  else
+    test_filter+=" and not (package(flywheel) and binary(/^self_update/))"
+    scope_note+=", self-update skipped"
+  fi
+}
+
 run_tests() {
   unset RUST_TEST_THREADS NEXTEST_TEST_THREADS
   if cargo nextest --version >/dev/null 2>&1; then
-    scripts/run_silent.sh "cargo test" cargo nextest run --workspace --no-fail-fast
+    scope_tests
+    echo "  ..   tests: $scope_note (CHECK_FULL=1 runs all)"
+    if [[ "$test_filter" == none ]]; then return; fi
+    local filter_args=()
+    if [[ -n "$test_filter" ]]; then filter_args=(-E "$test_filter"); fi
+    scripts/run_silent.sh "cargo test" cargo nextest run --workspace --no-fail-fast --no-tests=pass \
+      "${filter_args[@]}"
     scripts/run_silent.sh "doctests"   cargo test --workspace --doc
   else
     scripts/run_silent.sh "cargo test" cargo test --workspace --no-fail-fast

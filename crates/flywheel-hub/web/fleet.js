@@ -27,6 +27,10 @@
 // from GET /api/telemetry/lanes (the CLI's `fw hub fleet --lanes`), read
 // again on each push (at most every 1.5 s) and every 15 s.
 //
+// The header reads the build budget (GET /api/budget, `fw hub budget`):
+// build slots in use of the shared compile pool, the machine's CPU, I/O
+// wait, and free memory, and what bounds it; every 5 s while open.
+//
 // Insights say where time and money went (GET /api/telemetry/insights,
 // `fw hub insights`): per project, tool time by command, polling, what
 // keeps failing, files written again and again, and the context tax.
@@ -906,6 +910,49 @@ window.FwHubFleet = function (ctx) {
     if (dialog.open && ui.sources.some((s) => s.machine === name && !s.ok)) load(false);
   }
 
+  // --- the build budget ----------------------------------------------------
+
+  const budgetLine = $("#fl-budget");
+  let budgetSeq = 0;
+
+  async function loadBudget() {
+    const seq = ++budgetSeq;
+    let view;
+    try {
+      view = await rawApi("GET", "/api/budget");
+    } catch (_) {
+      // A hub from before the budget: no readout.
+      if (seq === budgetSeq) budgetLine.hidden = true;
+      return;
+    }
+    if (seq !== budgetSeq || !dialog.open) return;
+    const bits = [];
+    const pool = view.pool;
+    if (pool) bits.push(el("b", { textContent: `build slots ${pool.in_use}/${pool.jobs}` }));
+    else bits.push(el("b", { textContent: view.enabled ? "build budget: no pool" : "build budget off" }));
+    const p = view.pressure;
+    if (p) {
+      const gib = (n) => `${(n / 2 ** 30).toFixed(1)} GiB`;
+      bits.push(` · cpu ${Math.round(p.cpu_busy_pct)}% · io wait ${Math.round(p.iowait_pct)}% · ${gib(p.mem_available_bytes)} free`);
+      if (p.swap_out_pages_per_sec > 0) bits.push(` · swapping ${Math.round(p.swap_out_pages_per_sec)} pages/s`);
+    }
+    bits.push(" · bound by ", el("span", { className: `fl-bound ${view.constraint}`, textContent: view.constraint }));
+    const title = [];
+    if (pool) {
+      title.push(`${pool.tokens - pool.free} of ${pool.tokens} tokens taken, ${pool.cargo} building cargo (one slot each), ${pool.rustc} rustc`);
+      for (const use of pool.sessions || []) {
+        title.push(`${use.name || use.session || "outside any session"}: ${use.cargo} cargo, ${use.rustc} rustc, ${use.other} other`);
+      }
+    }
+    for (const host of view.fleet || []) {
+      const s = host.sample || {};
+      title.push(`hub ${host.host.slice(0, 8)}: ${s.pool ? `slots ${s.pool.in_use}/${s.pool.jobs}` : "no pool"}, bound by ${s.constraint}`);
+    }
+    budgetLine.replaceChildren(...bits);
+    budgetLine.title = title.join("\n");
+    budgetLine.hidden = false;
+  }
+
   // --- open / close --------------------------------------------------------
 
   function open() {
@@ -925,13 +972,16 @@ window.FwHubFleet = function (ctx) {
     if (ui.view === "lanes") loadLanes();
     else if (ui.view === "insights") loadInsights();
     else load(false);
+    loadBudget();
     clearInterval(ui.timer);
     let ticks = 0;
     ui.timer = setInterval(() => {
       if (document.visibilityState !== "visible") return;
       parts.tick(ui.view === "lanes" ? board : list);
+      ticks += 1;
+      if (ticks % 5 === 0) loadBudget();
       // A tool call becomes a wait with time alone.
-      if (ui.view === "lanes" && ++ticks % 15 === 0) loadLanes();
+      if (ui.view === "lanes" && ticks % 15 === 0) loadLanes();
     }, 1000);
   }
 

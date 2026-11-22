@@ -6,6 +6,12 @@
 
 #dlg-fleet { width: min(88rem, calc(100vw - 2rem)); height: min(52rem, calc(100dvh - 3rem)); overflow: hidden; }
 
+/* --- the build budget readout (GET /api/budget) ---------------------------- */
+.fl-budget { margin: .2rem 0 0; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.fl-budget b { color: var(--ink-2); font-weight: 700; }
+.fl-budget .fl-bound { color: var(--brass); }
+.fl-budget .fl-bound.none { color: var(--ink-3); }
+
 /* --- the status filter ------------------------------------------------------ */
 .fl-filters:empty { display: none; }
 .fl-chip { gap: .55rem; padding-left: .6rem; }

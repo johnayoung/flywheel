@@ -169,7 +169,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days; `eval=` or `fw.eval=` labelled sessions are kept) and folded into what it is doing now.
 
-- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**.
+- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**; header: build slots, the machine's bound (`fw hub budget`).
 - **Needs you** (sidebar, `fw hub inbox`, `fw hub holds`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row, with its context. Holds: kind (`needs_input` `awaiting_approval` `permission` `gate`) + cause; alike ones fold into one row, answered at once. Answers kept: `fw hub decisions`.
 - **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
 - **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions); `session_status` reads one. Children report via a `children` watch; a waiting lead: `background`. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask`, `allowed`, `off`; `[agent_starts]` limits; `fw hub new` inside an agent obeys it.

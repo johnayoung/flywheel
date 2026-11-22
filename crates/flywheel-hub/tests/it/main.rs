@@ -6,7 +6,6 @@ mod support;
 
 mod activity;
 mod broadcast;
-mod budget;
 mod commands;
 mod digest;
 mod endings;

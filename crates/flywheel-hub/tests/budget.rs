@@ -7,7 +7,7 @@
 //! One test, alone in its binary: it sets this process's environment
 //! (the hub's), which nothing else may read meanwhile.
 
-use crate::support;
+mod support;
 
 use flywheel_hub::budget::{BudgetConfig, FIFO_FILE, VARS};
 use flywheel_hub::state::WorkspaceInput;
@@ -98,8 +98,13 @@ fn sessions_take_the_budget_unless_the_hub_env_or_the_session_says_otherwise() {
     // This process's own setting of a variable wins (an agent session
     // running these tests may cap its test threads already).
     let theirs = |key: &str| std::env::var(key).ok();
-    for key in ["MAKEFLAGS", "CARGO_MAKEFLAGS"] {
-        assert!(theirs(key).is_none(), "run without {key} set");
+    // A hub session running these tests exports its own hub's pool; the
+    // hubs built here must start without one.
+    // SAFETY: the only test in this binary; no other thread reads the
+    // environment while it changes.
+    unsafe {
+        std::env::remove_var("MAKEFLAGS");
+        std::env::remove_var("CARGO_MAKEFLAGS");
     }
 
     let on = BudgetConfig {

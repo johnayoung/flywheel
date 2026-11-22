@@ -6,8 +6,7 @@
 //! The fail-loud case (a configured-but-unreachable target) needs no server:
 //! it uses a closed local port.
 
-#[path = "../../flywheel-core/tests/support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use flywheel_core::store::CURRENT_SCHEMA_VERSION;
 use flywheel_orchestrator::pg_preflight::{

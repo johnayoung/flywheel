@@ -7,8 +7,7 @@
 //! with a message, when Docker is unavailable; its own concurrency and
 //! migration cases live in `claims_postgres.rs`.
 
-#[path = "../../flywheel-core/tests/support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1821,7 +1820,7 @@ fn pause_account_sqlite_v10_store_upgrades_in_place_keeping_every_row() {
     let path = dir.path().join("v10.db");
     let before: Vec<Vec<String>> = {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(include_str!("fixtures/orchestrator-schema-v10.sql"))
+        conn.execute_batch(include_str!("../fixtures/orchestrator-schema-v10.sql"))
             .unwrap();
         ORCH_PARTITIONED_TABLES
             .iter()

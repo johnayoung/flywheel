@@ -14,8 +14,7 @@
 //! `flywheel-core/tests/support/pg_container.rs` and skips, with a message,
 //! when Docker is unavailable.
 
-#[path = "../../flywheel-core/tests/support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use std::collections::BTreeSet;
 use std::sync::mpsc::RecvTimeoutError;
@@ -421,7 +420,7 @@ fn a_v9_schema_upgrades_in_place_keyed_by_the_partition() {
                '2026-05-28T12:00:30+00:00', '2026-05-28T12:00:00+00:00');
              INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at)
                VALUES ('t1', 't0', '2026-05-28T12:00:00+00:00');",
-            include_str!("fixtures/orchestrator-schema-postgres-v9.sql")
+            include_str!("../fixtures/orchestrator-schema-postgres-v9.sql")
         ))
         .unwrap();
     let upgrade = PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj").unwrap();
@@ -486,7 +485,7 @@ fn pause_account_postgres_v10_schema_upgrades_in_place_keeping_every_row() {
     pg.admin()
         .batch_execute(&format!(
             "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\", public;\n{}",
-            include_str!("fixtures/orchestrator-schema-postgres-v10.sql")
+            include_str!("../fixtures/orchestrator-schema-postgres-v10.sql")
         ))
         .unwrap();
     let mut admin = pg.admin_in(&schema);

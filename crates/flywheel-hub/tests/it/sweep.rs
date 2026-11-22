@@ -380,10 +380,15 @@ async fn a_sweep_lists_exactly_the_idle_worktrees_and_deletes_only_their_target_
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(rows.len(), 3, "{rows:#?}");
-    assert!(
-        rows.iter()
-            .all(|r| r["data"]["bytes"].as_u64().unwrap() > 0)
-    );
+    for row in &rows {
+        assert!(row["data"]["bytes"].as_u64().unwrap() > 0, "{row}");
+        assert_eq!(row["data"]["repo"], "repo", "{row}");
+        let text = row.to_string();
+        assert!(
+            !text.contains(&*root.to_string_lossy()),
+            "no path in a row: {text}"
+        );
+    }
     let (code, out, err) = run_cli(&["budget", "--json", "--state-dir", &state_arg]).await;
     assert_eq!(code, 0, "{err}");
     let budget: Value = serde_json::from_str(&out).unwrap();

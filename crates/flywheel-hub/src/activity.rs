@@ -9,8 +9,7 @@
 //! only what the UI already shows in short: the event kind, the session's
 //! and workspace's ids and names, and a few whitelisted facts (a status,
 //! a branch, a count, a cost). Never terminal output, prompts, command
-//! text, grader output, credentials, or paths (but the worktree a build
-//! sweep deleted from, [`crate::sweep`]); free text is capped and
+//! text, grader output, credentials, or paths; free text is capped and
 //! scrubbed of token-shaped words ([`scrub`]).
 //!
 //! Bounds: the file rotates at [`FILE_CAP`] bytes or once its first row is

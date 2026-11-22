@@ -5,6 +5,7 @@
 //! event log.
 
 use super::Hub;
+use crate::activity::Draft;
 use crate::state::SessionState;
 use crate::sweep::{self, LastSweep, Look, Report, SHORT_EVENT, SWEPT_EVENT, disk::DiskUse};
 use serde_json::json;
@@ -34,6 +35,38 @@ impl SweepRuntime {
             ..Self::default()
         }
     }
+}
+
+/// The activity row of one deletion: the repo's name, bytes, and reason,
+/// never a path (the event log has those).
+fn swept_row(gone: &sweep::Deleted) -> Draft {
+    let repo = gone
+        .repo
+        .file_name()
+        .map_or_else(|| "a repo".to_owned(), |n| n.to_string_lossy().into_owned());
+    Draft::new(
+        SWEPT_EVENT,
+        format!(
+            "deleted a {repo} worktree's target/ ({}, {})",
+            crate::util::human_bytes(gone.bytes),
+            gone.why.as_str()
+        ),
+    )
+    .with("repo", repo)
+    .with("bytes", gone.bytes)
+    .with("reason", gone.why.as_str())
+}
+
+/// The activity row of a sweep that ran out of candidates: how many
+/// filesystems, never which paths.
+fn short_row(high_watermark: u8, disks: usize) -> Draft {
+    Draft::new(
+        SHORT_EVENT,
+        format!(
+            "{disks} disk(s) past {high_watermark}% with no build output left to sweep (fw hub budget)"
+        ),
+    )
+    .with("count", u64::try_from(disks).unwrap_or(0))
 }
 
 impl Hub {
@@ -131,20 +164,7 @@ impl Hub {
                 "by": by,
             });
             self.log_hub_event(SWEPT_EVENT, None, data);
-            self.write_activity(
-                crate::activity::Draft::new(
-                    SWEPT_EVENT,
-                    format!(
-                        "deleted {}/target ({}, {})",
-                        gone.path.display(),
-                        crate::util::human_bytes(gone.bytes),
-                        gone.why.as_str()
-                    ),
-                )
-                .with("path", gone.path.to_string_lossy().into_owned())
-                .with("bytes", gone.bytes)
-                .with("reason", gone.why.as_str()),
-            );
+            self.write_activity(swept_row(gone));
         });
         if report.short {
             if !self.sweep.told_short.swap(true, Ordering::SeqCst) {
@@ -154,16 +174,8 @@ impl Hub {
                     .filter(|d| d.used_pct >= f64::from(config.high_watermark))
                     .map(|d| d.mount.as_ref().unwrap_or(&d.path).display().to_string())
                     .collect();
-                let text = format!(
-                    "disk past {}% with no build output left to sweep: {}",
-                    config.high_watermark,
-                    full.join(", ")
-                );
                 self.log_hub_event(SHORT_EVENT, None, json!({ "disks": full }));
-                self.write_activity(
-                    crate::activity::Draft::new(SHORT_EVENT, text)
-                        .with("count", u64::try_from(full.len()).unwrap_or(0)),
-                );
+                self.write_activity(short_row(config.high_watermark, full.len()));
             }
         } else {
             self.sweep.told_short.store(false, Ordering::SeqCst);
@@ -229,5 +241,37 @@ impl Hub {
         if let Err(e) = spawned {
             eprintln!("fw hub: build sweep: no automatic sweeps: cannot start its thread: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn activity_rows_name_the_repo_and_never_a_path() {
+        let gone = sweep::Deleted {
+            path: PathBuf::from("/home/u/code/flywheel.worktrees/task-7"),
+            repo: PathBuf::from("/home/u/code/flywheel"),
+            target: PathBuf::from("/home/u/code/flywheel.worktrees/task-7/target"),
+            bytes: 3 << 30,
+            why: sweep::Why::Merged,
+        };
+        for row in [swept_row(&gone), short_row(90, 2)] {
+            let all = format!("{} {:?}", row.text, row.data);
+            assert!(!all.contains('/') || all.contains("target/"), "{all}");
+            assert!(!all.contains("/home"), "{all}");
+            assert!(!all.contains("task-7"), "{all}");
+        }
+        let row = swept_row(&gone);
+        assert_eq!(
+            row.text,
+            "deleted a flywheel worktree's target/ (3.0 GiB, merged)"
+        );
+        assert_eq!(row.data["repo"], "flywheel");
+        assert_eq!(row.data["bytes"], 3u64 << 30);
+        assert_eq!(row.data["reason"], "merged");
+        assert!(!row.data.contains_key("path"));
     }
 }

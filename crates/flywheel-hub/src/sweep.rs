@@ -143,6 +143,8 @@ pub struct Kept {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Deleted {
     pub path: PathBuf,
+    /// The repo's main checkout.
+    pub repo: PathBuf,
     pub target: PathBuf,
     pub bytes: u64,
     pub why: Why,
@@ -613,6 +615,7 @@ pub fn execute(
             Ok(()) => {
                 let gone = Deleted {
                     path: c.path.clone(),
+                    repo: c.repo.clone(),
                     target: c.target.clone(),
                     bytes: c.bytes,
                     why: c.why,

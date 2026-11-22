@@ -160,7 +160,7 @@ Matches within `--window` (3 s), or while that prompt waits, join it (40 listed)
 What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: digest, then timeline; `--since last-seen`: since this CLI last looked).
 
 - **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`, `build.swept`, `build.sweep_short`. A row opens its object or attaches.
-- **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths (but a swept worktree's); token-shaped words: `[redacted]`.
+- **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths; token-shaped words: `[redacted]`.
 - **Event log** (`fw hub tail [-f]`): every telemetry, label, and hub event (the rows above, `status.changed`, `queue.*`, `decision.made`, `flywheel.changed`) in arrival order, 30 days, by opaque cursor; a collector's holds every hub's.
 - **Filters** (FILTER: `state=done|failed children=lead team=web kind=review`): session, ws, state (events that moved a session there), labels (now, or either side of a change), kind or family. `fw hub wait --fleet FILTER` blocks for one.
 - **While you were away** (10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged; silent: `partial`.

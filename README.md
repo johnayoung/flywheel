@@ -67,7 +67,7 @@ A Cargo workspace of eight crates under `crates/`. Dependencies point one way on
 | `flywheel-hub` | `fw hub`: web workspace of server-owned agent terminals (axum server, REST + WebSocket API, embedded web UI). Depends on no other flywheel crate. |
 | `flywheel` | The `flywheel` / `fw` binaries: verb router and operator console. Bundles the container backend. |
 
-Development: `scripts/check.sh` runs the full CI gate (rustfmt, clippy, cargo test; quiet on success). See [CONTRIBUTING.md](CONTRIBUTING.md).
+Development: `scripts/check.sh` runs the gate (rustfmt, clippy, cargo test; quiet on success). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Docs
 

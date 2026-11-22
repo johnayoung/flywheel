@@ -52,6 +52,15 @@ impl TestHub {
     /// A hub that has seen Claude Code `version` in an earlier run (the
     /// file a status line leaves), or none yet.
     async fn start_knowing(upstream: Option<&str>, version: Option<&str>) -> Self {
+        Self::start_with(upstream, version, |_| {}).await
+    }
+
+    /// A hub with `tweak` applied to its options.
+    async fn start_with(
+        upstream: Option<&str>,
+        version: Option<&str>,
+        tweak: impl FnOnce(&mut HubOptions),
+    ) -> Self {
         flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo")).unwrap();
@@ -65,6 +74,7 @@ impl TestHub {
         options.report_command = Some(vec!["/opt/flywheel/bin/fw".into(), "hub".into()]);
         options.claude_config_dir = Some(dir.path().join("claude-config"));
         options.codex_home = Some(dir.path().join("codex-home"));
+        tweak(&mut options);
         let hub = support::open_hub(options);
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -633,6 +643,80 @@ async fn a_hub_forwards_its_events_to_its_collector() {
             .unwrap();
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     }
+    edge.shutdown().await;
+    collector.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collector_takes_each_hubs_build_budget_samples() {
+    let collector = TestHub::start(None).await;
+    let edge = TestHub::start_with(Some("collector"), Some("2.1.322"), |options| {
+        options.build_budget = flywheel_hub::budget::BudgetConfig {
+            enabled: true,
+            jobs: 4,
+            test_threads: 2,
+        };
+    })
+    .await;
+    let issued = collector
+        .post("/api/peers", json!({ "name": "edge" }))
+        .await;
+    edge.post(
+        "/api/machines",
+        json!({ "name": "collector", "url": collector.base(), "credential": issued["credential"] }),
+    )
+    .await;
+
+    // The edge's own reading: its pool, full, and the machine.
+    let own = edge.get("/api/budget").await;
+    assert_eq!(own["enabled"], true);
+    assert_eq!(own["pool"]["jobs"], 4);
+    assert_eq!(own["pool"]["free"], 3);
+    assert_eq!(own["pool"]["in_use"], 0);
+    assert!(own["constraint"].is_string(), "{own}");
+
+    let edge_host = edge.hub.telemetry().host().to_owned();
+    let samples = || async {
+        collector
+            .get(&format!(
+                "/api/log?after=start&host={edge_host}&kind=budget.sample&limit=50"
+            ))
+            .await["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let first = loop {
+        if let Some(first) = samples().await.first().cloned() {
+            break first;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no budget sample reached the collector"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(first["body"]["pool"]["jobs"], 4);
+    assert!(first["body"]["pool"].get("sessions").is_none(), "{first}");
+    if cfg!(target_os = "linux") {
+        assert!(
+            first["body"]["pressure"]["mem_total_bytes"].as_u64() > Some(0),
+            "{first}"
+        );
+    }
+    // The collector's own budget view lists the edge.
+    let theirs = collector.get("/api/budget").await;
+    let fleet = theirs["fleet"].as_array().unwrap();
+    assert!(
+        fleet
+            .iter()
+            .any(|h| h["host"] == edge_host.as_str() && h["sample"]["pool"]["jobs"] == 4),
+        "{theirs}"
+    );
+    // Within the period, however the machine moves: no second sample.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(samples().await.len(), 1);
     edge.shutdown().await;
     collector.shutdown().await;
 }

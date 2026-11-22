@@ -837,6 +837,10 @@ pub(crate) struct NewArgs {
     /// Label it KEY=VALUE; repeatable (fw.* keys are the hub's).
     #[arg(long = "label", value_name = "KEY=VALUE")]
     labels: Vec<String>,
+    /// Start it outside the build budget: no shared compile pool or test
+    /// thread cap (`fw hub budget`).
+    #[arg(long)]
+    no_build_budget: bool,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -994,6 +998,9 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     }
     if let Some(account) = &args.account {
         body["account"] = json!(account);
+    }
+    if args.no_build_budget {
+        body["build_budget"] = json!(false);
     }
     if !args.labels.is_empty() {
         let change = crate::labels::parse_change(&args.labels, &[]).map_err(|e| e.to_string())?;

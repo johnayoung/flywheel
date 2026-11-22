@@ -81,6 +81,19 @@ pub struct FileConfig {
     pub digest: crate::digest::DigestSection,
     #[serde(default)]
     pub telemetry: TelemetrySection,
+    #[serde(default)]
+    pub build_budget: BuildBudgetSection,
+}
+
+/// One compile-job pool for every session (see [`crate::budget`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildBudgetSection {
+    pub enabled: Option<bool>,
+    /// The pool's size; default the machine's threads - 2.
+    pub jobs: Option<usize>,
+    /// Test threads per session; default max(2, threads / 4).
+    pub test_threads: Option<usize>,
 }
 
 /// Session telemetry (see [`crate::telemetry`]).
@@ -472,6 +485,7 @@ pub struct Effective {
     pub digest: crate::digest::DigestConfig,
     /// The machine this hub forwards its telemetry to.
     pub telemetry_upstream: Option<String>,
+    pub build_budget: crate::budget::BudgetConfig,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -527,6 +541,9 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("digest.channels", Apply::Live),
     ("digest.quiet_if_empty", Apply::Live),
     ("telemetry.upstream", Apply::Restart),
+    ("build_budget.enabled", Apply::Restart),
+    ("build_budget.jobs", Apply::Restart),
+    ("build_budget.test_threads", Apply::Restart),
 ];
 
 impl Effective {
@@ -628,6 +645,9 @@ impl Effective {
             "digest.channels" => json!(self.digest.channels.names()),
             "digest.quiet_if_empty" => json!(self.digest.quiet_if_empty),
             "telemetry.upstream" => json!(self.telemetry_upstream),
+            "build_budget.enabled" => json!(self.build_budget.enabled),
+            "build_budget.jobs" => json!(self.build_budget.jobs),
+            "build_budget.test_threads" => json!(self.build_budget.test_threads),
             _ => Value::Null,
         }
     }
@@ -1123,11 +1143,47 @@ pub fn resolve(
         file_upstream,
         None
     );
+    let machine = crate::budget::BudgetConfig::for_threads(crate::budget::threads());
+    let budget_count = |key: &str, value: Option<usize>, errors: &mut Vec<String>| {
+        value.and_then(|n| {
+            if (1..=crate::budget::MAX_JOBS).contains(&n) {
+                Some(n)
+            } else {
+                errors.push(format!(
+                    "{key}: {n} is outside 1..={}",
+                    crate::budget::MAX_JOBS
+                ));
+                None
+            }
+        })
+    };
+    let file_jobs = budget_count("build_budget.jobs", file.build_budget.jobs, &mut errors);
+    let file_test_threads = budget_count(
+        "build_budget.test_threads",
+        file.build_budget.test_threads,
+        &mut errors,
+    );
+    let build_budget = crate::budget::BudgetConfig {
+        enabled: pick!(
+            "build_budget.enabled",
+            None::<bool>,
+            file.build_budget.enabled,
+            true
+        ),
+        jobs: pick!("build_budget.jobs", None::<usize>, file_jobs, machine.jobs),
+        test_threads: pick!(
+            "build_budget.test_threads",
+            None::<usize>,
+            file_test_threads,
+            machine.test_threads
+        ),
+    };
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(Effective {
         telemetry_upstream,
+        build_budget,
         bind,
         port,
         public_urls,
@@ -1764,6 +1820,11 @@ quiet_if_empty = true      # skip a scheduled one with nothing in it
 
 [telemetry]
 upstream = "collector"     # the machine that takes this hub's session events
+
+[build_budget]             # one compile-job pool for every session
+enabled = true
+jobs = 30                  # pool size; default threads - 2
+test_threads = 8           # per session; default max(2, threads / 4)
 "#;
 
 #[cfg(test)]

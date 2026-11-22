@@ -347,6 +347,17 @@ impl Telemetry {
         lock(&self.inner.read).lease_holds(limit)
     }
 
+    /// Each host's newest hub event `kind` since `since` (see
+    /// [`Store::latest_per_host`]).
+    pub fn latest_per_host(
+        &self,
+        kind: &str,
+        since: i64,
+    ) -> Result<Vec<(String, i64, serde_json::Value)>, StoreError> {
+        self.flush();
+        lock(&self.inner.read).latest_per_host(kind, since)
+    }
+
     /// A page of a session's events (see [`Store::events`]).
     pub fn events(
         &self,

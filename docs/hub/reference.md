@@ -55,6 +55,7 @@ fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--cr
     [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--template NAME]
     [--resume ID | --continue]  # agents: pick up a conversation of the folder (no --prompt, no --worktree)
     [--account NAME]  # claude: run under that account's token instead of the CLI's login
+    [--no-build-budget]  # outside the shared compile pool and test thread cap
     [--label K=V]...
 fw hub label SESSION [K=V]... [--unset K]... [--if V | --if-unset] [--json] {where}  # no K=V: print; exit 1 condition failed
 fw hub account ls [--json] [--state-dir DIR]
@@ -94,6 +95,7 @@ fw hub ends SESSION [--approve ID | --decline ID | --cancel] [--json] {where}  #
 fw hub holds [--kind K] [--answer A HOLD|N... [--except ID[=A]]...] [--json] {where}  # N: a group's number
 fw hub decisions [--kind K] [--session S] [--since AGE|TIME] [--limit N] [--json] {where}
 fw hub insights [--hours N] [--project NAME] [--host HUB_ID] [--json] {where}
+fw hub budget [--json] {where}  # build slots in use, by session; machine pressure; other hubs
 fw hub capture install [--settings FILE]  # outside runs report
 fw hub capture uninstall [--settings FILE]
 fw hub capture status [--settings FILE]
@@ -299,6 +301,11 @@ quiet_if_empty = true      # skip a scheduled one with nothing in it
 
 [telemetry]
 upstream = "collector"     # the machine that takes this hub's session events
+
+[build_budget]             # one compile-job pool for every session
+enabled = true
+jobs = 30                  # pool size; default threads - 2
+test_threads = 8           # per session; default max(2, threads / 4)
 ```
 
 | Key | Flag | Default | Applies |
@@ -344,6 +351,12 @@ upstream = "collector"     # the machine that takes this hub's session events
 | `digest.channels` | - | all three | live |
 | `digest.quiet_if_empty` | - | `true` | live |
 | `telemetry.upstream` | - | none | restart |
+| `build_budget.enabled` | - | `true` | restart |
+| `build_budget.jobs` | - | threads - 2 (1-4096) | restart |
+| `build_budget.test_threads` | - | max(2, threads / 4) (1-4096) | restart |
+
+**Build budget:** sessions get `MAKEFLAGS`/`CARGO_MAKEFLAGS` (`-j<jobs> --jobserver-auth=fifo:<state-dir>/build-jobserver.fifo`, `jobs - 1` tokens) and `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS`;
+the hub's own values win (the jobserver pair together). Unheld: refilled.
 
 Elsewhere: push (`notify.toml`: secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 

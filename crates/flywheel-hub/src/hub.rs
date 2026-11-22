@@ -1,6 +1,7 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
+mod budget;
 mod capture;
 pub mod changes;
 mod close;
@@ -143,6 +144,12 @@ pub struct HubOptions {
     pub lease_stuck: (Duration, Duration),
     /// How often the hub looks for stuck leases (ms); tests shorten it.
     pub lease_stuck_look_ms: i64,
+    /// One compile-job pool for every session (see [`crate::budget`]);
+    /// off unless the config turns it on (`fw hub serve` does by default).
+    pub build_budget: crate::budget::BudgetConfig,
+    /// The least time between two recorded budget samples; tests shorten
+    /// it.
+    pub budget_sample_every: Duration,
 }
 
 impl HubOptions {
@@ -186,6 +193,8 @@ impl HubOptions {
                 Duration::from_millis(crate::leases::DEFAULT_STUCK_MS as u64),
             ),
             lease_stuck_look_ms: crate::hub::leases::STUCK_LOOK_MS,
+            build_budget: crate::budget::BudgetConfig::off(),
+            budget_sample_every: crate::budget::SAMPLE_EVERY,
         }
     }
 }
@@ -269,6 +278,8 @@ pub struct CreateSession {
     /// Its first labels (no `fw.*` keys: the hub sets those).
     #[serde(default)]
     pub labels: crate::labels::Labels,
+    /// `false`: start it outside the build budget (see [`crate::budget`]).
+    pub build_budget: Option<bool>,
 }
 
 /// [`CreateSession::resume`]'s value for the folder's newest conversation.
@@ -629,6 +640,8 @@ pub struct Hub {
     batches: Mutex<std::collections::HashMap<String, String>>,
     /// What every agent session does (see [`crate::telemetry`]).
     telemetry: Arc<crate::telemetry::Telemetry>,
+    /// The compile-job pool sessions share (see [`crate::budget`]).
+    budget: crate::budget::BuildBudget,
     /// How far each watch has looked in the log (see [`crate::watch`]).
     watches: crate::watch::Engine,
     /// Leases on named resources (see [`crate::leases`]).
@@ -745,8 +758,14 @@ impl Hub {
                 }
             });
         }
+        let budget = crate::budget::BuildBudget::open(
+            &options.state_dir,
+            options.build_budget,
+            options.budget_sample_every,
+        );
         Ok(Arc::new(Self {
             telemetry,
+            budget,
             watches: crate::watch::Engine::default(),
             leases: leases::LeaseRuntime::open(&options.state_dir),
             reviews: crate::reviews::ReviewStore::new(&options.state_dir),

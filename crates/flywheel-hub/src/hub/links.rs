@@ -235,6 +235,7 @@ impl Hub {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            no_build_budget: from.no_build_budget,
             labels: Default::default(),
         };
         // Taken before the launch, so two starts of one handoff start one

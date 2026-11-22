@@ -269,6 +269,7 @@ impl Hub {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            no_build_budget: request.build_budget == Some(false),
             labels: first_labels,
         };
         if record
@@ -614,6 +615,7 @@ impl Hub {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            no_build_budget: agent.no_build_budget,
             labels: Default::default(),
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
@@ -761,6 +763,10 @@ impl Hub {
                 key.secret.expose().to_owned(),
             ));
         }
+        // The build budget's pool and test threads, unless the hub's own
+        // environment or the spawn already sets them.
+        let budget = self.budget_env(record, &env);
+        env.extend(budget);
         let session = PtySession::spawn(
             SpawnSpec {
                 argv,

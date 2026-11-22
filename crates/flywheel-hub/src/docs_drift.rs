@@ -685,7 +685,9 @@ const PAGES: [(&str, &str); 6] = [
 /// option), after condensing the agent-ends text it extends; to 99 KiB
 /// for adopted worktrees and time watches (two verbs, three routes, an
 /// agent tool), then condensed across docs/hub by 0.6 KB to 99.8 KB.
-const HUB_DOCS_MAX_BYTES: usize = 99 * 1024;
+/// Raised to 100 KiB for the build budget (a verb, a route, three keys,
+/// a session field, an event, a board readout), after condensing api.md.
+const HUB_DOCS_MAX_BYTES: usize = 100 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

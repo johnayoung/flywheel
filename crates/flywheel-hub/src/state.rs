@@ -318,6 +318,10 @@ pub struct SessionRecord {
     /// The operator opted it out of relaunches after an upgrade.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub never_relaunch: bool,
+    /// Started outside the build budget (see [`crate::budget`]): its
+    /// environment is what it would be without the feature.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_build_budget: bool,
     /// Its labels (see [`crate::labels`]): `fw.*` keys set by the hub,
     /// the rest by the operator and agents.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -654,6 +658,9 @@ pub struct PendingStart {
     /// The labels it starts with.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: crate::labels::Labels,
+    /// `Some(false)`: it starts outside the build budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_budget: Option<bool>,
 }
 
 /// A new worktree a pending start asks for: its task, and the branch to

@@ -26,6 +26,8 @@ pub mod autopilot_cli;
 pub mod broadcast;
 pub mod broadcast_cli;
 pub mod browser;
+pub mod budget;
+mod budget_cli;
 mod capture_cli;
 mod change_cli;
 pub mod changes;

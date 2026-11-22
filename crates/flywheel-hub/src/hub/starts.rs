@@ -275,6 +275,7 @@ impl Hub {
             account: from.account.clone(),
             created_at: Utc::now(),
             labels: Default::default(),
+            build_budget: from.no_build_budget.then_some(false),
         };
         // Resolved now, so a bad folder is refused now.
         self.start_request(&from, &pending)?;
@@ -339,6 +340,7 @@ impl Hub {
             account: trimmed(request.account.as_deref()),
             created_at: Utc::now(),
             labels: request.labels,
+            build_budget: request.build_budget,
         };
         self.decide_start(&opener, policy, pending)
     }
@@ -411,6 +413,7 @@ impl Hub {
             account: pending.account.clone(),
             shared_worktree: shared,
             labels: pending.labels.clone(),
+            build_budget: pending.build_budget,
             ..CreateSession::default()
         })
     }
@@ -723,6 +726,7 @@ mod tests {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            no_build_budget: false,
             labels: Default::default(),
         }
     }

@@ -483,6 +483,35 @@ impl Store {
             .collect())
     }
 
+    /// Each host's newest hub-scoped `kind` event at or after `since`
+    /// (unix ms), as (host, ts, body), by host.
+    pub fn latest_per_host(
+        &self,
+        kind: &str,
+        since: i64,
+    ) -> Result<Vec<(String, i64, serde_json::Value)>, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT host, ts, body FROM events WHERE id IN (
+                 SELECT MAX(id) FROM events
+                 WHERE ts >= ?1 AND kind = ?2 AND session = ?3 GROUP BY host)
+             ORDER BY host",
+        )?;
+        let rows = query.query_map(params![since, kind, super::HUB_SCOPE], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .map(|(host, ts, body)| {
+                let body = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                (host, ts, body)
+            })
+            .collect())
+    }
+
     /// A session's events at or after `from` (unix ms), oldest first: the
     /// last `cap` of them.
     pub fn events_from(

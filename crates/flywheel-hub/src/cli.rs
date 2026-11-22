@@ -236,6 +236,10 @@ enum HubCommand {
     /// (shared or exclusive, waiting in a fair line), run a command
     /// holding one, release, ls, break (operator).
     Lease(crate::lease_cli::LeaseArgs),
+    /// The build budget: the compile pool every session shares (slots in
+    /// use, which sessions hold them), the machine's CPU, I/O wait,
+    /// memory, and swap, what bounds it, and other hubs' last samples.
+    Budget(crate::budget_cli::BudgetArgs),
     /// Review records: record a verdict on BASE..HEAD, ls them (by repo
     /// or commit), check that a range is covered by READY reviews (exit 1
     /// when not), retract one (operator).
@@ -806,6 +810,7 @@ fn dispatch_verb(
         HubCommand::Tls(args) => crate::tls_cli::main(&args, out, err),
         HubCommand::Capture(args) => crate::capture_cli::main(&args, out, err),
         HubCommand::Insights(args) => crate::insights_cli::insights(&args, out, err),
+        HubCommand::Budget(args) => crate::budget_cli::budget(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),

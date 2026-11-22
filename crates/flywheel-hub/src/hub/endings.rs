@@ -2115,6 +2115,7 @@ fn successor_start(record: &SessionRecord, successor: &Successor) -> PendingStar
         launch: (!launch.is_empty()).then_some(launch),
         account: record.account.clone(),
         created_at: Utc::now(),
+        build_budget: record.no_build_budget.then_some(false),
         // The work goes on under the same labels (the hub sets its own).
         labels: record
             .labels
@@ -2188,6 +2189,7 @@ mod tests {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            no_build_budget: false,
             labels: Default::default(),
         }
     }

@@ -65,6 +65,7 @@ mod admission;
 mod auth;
 mod autopilot_api;
 mod broadcast_api;
+mod budget_api;
 mod ca_page;
 mod changes_api;
 mod close_api;
@@ -304,6 +305,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/log", get(log_api::read_log))
+        .route("/api/budget", get(budget_api::get_budget))
         .route(
             "/api/watches",
             get(watches_api::list_watches).post(watches_api::add_watch),

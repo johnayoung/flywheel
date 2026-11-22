@@ -95,6 +95,7 @@ pub(super) fn serve_cmd(
     options.agent_starts = effective.agent_starts;
     options.login_days = effective.login_days;
     options.build_budget = effective.build_budget;
+    options.build_sweep = effective.build_sweep;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

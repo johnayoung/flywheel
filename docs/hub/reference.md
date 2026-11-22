@@ -95,7 +95,9 @@ fw hub ends SESSION [--approve ID | --decline ID | --cancel] [--json] {where}  #
 fw hub holds [--kind K] [--answer A HOLD|N... [--except ID[=A]]...] [--json] {where}  # N: a group's number
 fw hub decisions [--kind K] [--session S] [--since AGE|TIME] [--limit N] [--json] {where}
 fw hub insights [--hours N] [--project NAME] [--host HUB_ID] [--json] {where}
-fw hub budget [--json] {where}  # build slots in use, by session; machine pressure; other hubs
+fw hub budget [--json] {where}  # build slots in use, by session; machine pressure; disks; other hubs
+fw hub sweep [--dry-run] [--all] [--json] {where}  # delete idle worktrees' target/
+fw hub sweep --keep PATH [--until TIME]  # write PATH/.fw-keep-build
 fw hub capture install [--settings FILE]  # outside runs report
 fw hub capture uninstall [--settings FILE]
 fw hub capture status [--settings FILE]
@@ -306,6 +308,13 @@ upstream = "collector"     # the machine that takes this hub's session events
 enabled = true
 jobs = 30                  # pool size; default threads - 2
 test_threads = 8           # per session; default max(2, threads / 4)
+
+[build_sweep]              # delete idle worktrees' target/ dirs
+enabled = true             # automatic; `fw hub sweep` works either way
+high_watermark = 90        # % used: sweep down to low_watermark
+low_watermark = 85
+merged_idle = "1d"
+stale_idle = "14d"
 ```
 
 | Key | Flag | Default | Applies |
@@ -354,9 +363,17 @@ test_threads = 8           # per session; default max(2, threads / 4)
 | `build_budget.enabled` | - | `true` | restart |
 | `build_budget.jobs` | - | threads - 2 (1-4096) | restart |
 | `build_budget.test_threads` | - | max(2, threads / 4) (1-4096) | restart |
+| `build_sweep.enabled` | - | `true` | restart |
+| `build_sweep.high_watermark` | - | `90` (1-100) | restart |
+| `build_sweep.low_watermark` | - | `85` (at most high) | restart |
+| `build_sweep.merged_idle` | - | `1d` | restart |
+| `build_sweep.stale_idle` | - | `14d` | restart |
 
 **Build budget:** sessions get `MAKEFLAGS`/`CARGO_MAKEFLAGS` (`-j<jobs> --jobserver-auth=fifo:<state-dir>/build-jobserver.fifo`, `jobs - 1` tokens) and `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS`;
 the hub's own values win (the jobserver pair together). Unheld: refilled.
+
+**Build sweep:** deletes only `target/` (own dir, Cargo, git-ignored) of a known repo's linked worktrees, never a main checkout's. Kept: a live session or process (cwd, files, maps, mounts) in it,
+`.fw-keep-build` at its root (line 1: RFC 3339 expiry), or untouched under `merged_idle` (HEAD in the default branch) / `stale_idle`; anything unsure. Rechecked before each delete, oldest first; checked every 10 min.
 
 Elsewhere: push (`notify.toml`: secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 

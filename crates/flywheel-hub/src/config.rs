@@ -83,6 +83,8 @@ pub struct FileConfig {
     pub telemetry: TelemetrySection,
     #[serde(default)]
     pub build_budget: BuildBudgetSection,
+    #[serde(default)]
+    pub build_sweep: BuildSweepSection,
 }
 
 /// One compile-job pool for every session (see [`crate::budget`]).
@@ -94,6 +96,19 @@ pub struct BuildBudgetSection {
     pub jobs: Option<usize>,
     /// Test threads per session; default max(2, threads / 4).
     pub test_threads: Option<usize>,
+}
+
+/// Finished worktrees' build output reclaimed (see [`crate::sweep`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSweepSection {
+    pub enabled: Option<bool>,
+    /// % used that starts a sweep.
+    pub high_watermark: Option<u8>,
+    /// % used a sweep goes down to.
+    pub low_watermark: Option<u8>,
+    pub merged_idle: Option<DurationSetting>,
+    pub stale_idle: Option<DurationSetting>,
 }
 
 /// Session telemetry (see [`crate::telemetry`]).
@@ -486,6 +501,7 @@ pub struct Effective {
     /// The machine this hub forwards its telemetry to.
     pub telemetry_upstream: Option<String>,
     pub build_budget: crate::budget::BudgetConfig,
+    pub build_sweep: crate::sweep::SweepConfig,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -544,6 +560,11 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("build_budget.enabled", Apply::Restart),
     ("build_budget.jobs", Apply::Restart),
     ("build_budget.test_threads", Apply::Restart),
+    ("build_sweep.enabled", Apply::Restart),
+    ("build_sweep.high_watermark", Apply::Restart),
+    ("build_sweep.low_watermark", Apply::Restart),
+    ("build_sweep.merged_idle", Apply::Restart),
+    ("build_sweep.stale_idle", Apply::Restart),
 ];
 
 impl Effective {
@@ -648,6 +669,15 @@ impl Effective {
             "build_budget.enabled" => json!(self.build_budget.enabled),
             "build_budget.jobs" => json!(self.build_budget.jobs),
             "build_budget.test_threads" => json!(self.build_budget.test_threads),
+            "build_sweep.enabled" => json!(self.build_sweep.enabled),
+            "build_sweep.high_watermark" => json!(self.build_sweep.high_watermark),
+            "build_sweep.low_watermark" => json!(self.build_sweep.low_watermark),
+            "build_sweep.merged_idle" => {
+                json!(crate::share::format_ttl(self.build_sweep.merged_idle))
+            }
+            "build_sweep.stale_idle" => {
+                json!(crate::share::format_ttl(self.build_sweep.stale_idle))
+            }
             _ => Value::Null,
         }
     }
@@ -702,6 +732,84 @@ pub fn read_file(path: &Path) -> Result<Option<FileConfig>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse(&text).map(Some)
+}
+
+/// `[build_sweep]` over its defaults; bad values reported as `key: why`.
+fn resolve_sweep(
+    file: &BuildSweepSection,
+    sources: &mut Vec<(&'static str, Source)>,
+    errors: &mut Vec<String>,
+) -> crate::sweep::SweepConfig {
+    let default = crate::sweep::SweepConfig::default();
+    let source = |set: bool| if set { Source::File } else { Source::Default };
+    let mut pct = |key: &'static str, value: Option<u8>, fallback: u8| match value {
+        Some(n) if (1..=100).contains(&n) => {
+            sources.push((key, Source::File));
+            n
+        }
+        Some(n) => {
+            errors.push(format!("{key}: {n} is outside 1..=100"));
+            fallback
+        }
+        None => {
+            sources.push((key, Source::Default));
+            fallback
+        }
+    };
+    let high = pct(
+        "build_sweep.high_watermark",
+        file.high_watermark,
+        default.high_watermark,
+    );
+    let low = pct(
+        "build_sweep.low_watermark",
+        file.low_watermark,
+        default.low_watermark,
+    );
+    if low > high {
+        errors.push(format!(
+            "build_sweep.low_watermark: {low} is above high_watermark {high}"
+        ));
+    }
+    let mut idle = |key: &'static str, value: Option<&DurationSetting>, fallback: Duration| {
+        sources.push((key, source(value.is_some())));
+        let Some(value) = value else {
+            return fallback;
+        };
+        let parsed = match value {
+            DurationSetting::Seconds(n) => Ok(*n),
+            DurationSetting::Text(text) => crate::util::parse_duration(text),
+        };
+        match parsed {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            Ok(_) => {
+                errors.push(format!("{key}: must be more than 0"));
+                fallback
+            }
+            Err(why) => {
+                errors.push(format!("{key}: {why} (e.g. 1d, 12h, 14d)"));
+                fallback
+            }
+        }
+    };
+    let merged_idle = idle(
+        "build_sweep.merged_idle",
+        file.merged_idle.as_ref(),
+        default.merged_idle,
+    );
+    let stale_idle = idle(
+        "build_sweep.stale_idle",
+        file.stale_idle.as_ref(),
+        default.stale_idle,
+    );
+    sources.push(("build_sweep.enabled", source(file.enabled.is_some())));
+    crate::sweep::SweepConfig {
+        enabled: file.enabled.unwrap_or(default.enabled),
+        high_watermark: high,
+        low_watermark: low,
+        merged_idle,
+        stale_idle,
+    }
 }
 
 /// Resolve every setting: `flags` over `file` over the defaults. Every
@@ -1178,12 +1286,14 @@ pub fn resolve(
             machine.test_threads
         ),
     };
+    let build_sweep = resolve_sweep(&file.build_sweep, &mut sources, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(Effective {
         telemetry_upstream,
         build_budget,
+        build_sweep,
         bind,
         port,
         public_urls,
@@ -1825,6 +1935,13 @@ upstream = "collector"     # the machine that takes this hub's session events
 enabled = true
 jobs = 30                  # pool size; default threads - 2
 test_threads = 8           # per session; default max(2, threads / 4)
+
+[build_sweep]              # delete idle worktrees' target/ dirs
+enabled = true             # automatic; `fw hub sweep` works either way
+high_watermark = 90        # % used: sweep down to low_watermark
+low_watermark = 85
+merged_idle = "1d"
+stale_idle = "14d"
 "#;
 
 #[cfg(test)]
@@ -2154,5 +2271,40 @@ max_hub = 5000
         std::fs::write(dir.path().join(CONFIG_FILE), "[server]\nport = -1\n").unwrap();
         let e = ConfigWatch::open(dir.path(), Flags::default(), None).unwrap_err();
         assert!(e.contains("hub.toml"), "{e}");
+    }
+
+    #[test]
+    fn build_sweep_resolves_its_defaults_and_reports_bad_values() {
+        let e = resolve(&parse("").unwrap(), &Flags::default(), home()).unwrap();
+        assert_eq!(e.build_sweep, crate::sweep::SweepConfig::default());
+        assert_eq!(e.value("build_sweep.merged_idle"), json!("1d"));
+        assert_eq!(e.source("build_sweep.stale_idle"), Source::Default);
+        let text = "[build_sweep]\nenabled = false\nhigh_watermark = 95\nlow_watermark = 70\nstale_idle = \"30d\"\n";
+        let e = resolve(&parse(text).unwrap(), &Flags::default(), home()).unwrap();
+        assert!(!e.build_sweep.enabled);
+        assert_eq!(
+            (e.build_sweep.high_watermark, e.build_sweep.low_watermark),
+            (95, 70)
+        );
+        assert_eq!(e.build_sweep.stale_idle, Duration::from_secs(30 * 86_400));
+        assert_eq!(e.source("build_sweep.stale_idle"), Source::File);
+        let bad =
+            "[build_sweep]\nhigh_watermark = 101\nlow_watermark = 80\nmerged_idle = \"soon\"\n";
+        let errors = resolve(&parse(bad).unwrap(), &Flags::default(), home()).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("build_sweep.high_watermark")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("build_sweep.merged_idle")),
+            "{errors:?}"
+        );
+        let inverted = "[build_sweep]\nhigh_watermark = 80\nlow_watermark = 90\n";
+        let errors = resolve(&parse(inverted).unwrap(), &Flags::default(), home()).unwrap_err();
+        assert!(errors[0].contains("above high_watermark"), "{errors:?}");
     }
 }

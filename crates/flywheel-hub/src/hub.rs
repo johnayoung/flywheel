@@ -24,6 +24,7 @@ pub use starts::{AgentStart, Opened};
 mod restore;
 mod sessions;
 mod status;
+mod sweep;
 mod telemetry;
 mod workspaces;
 mod worktrees;
@@ -150,6 +151,11 @@ pub struct HubOptions {
     /// The least time between two recorded budget samples; tests shorten
     /// it.
     pub budget_sample_every: Duration,
+    /// Build output of finished worktrees reclaimed (see [`crate::sweep`]);
+    /// automatic sweeps off unless the config turns them on.
+    pub build_sweep: crate::sweep::SweepConfig,
+    /// How often automatic sweeps look at the disks; tests shorten it.
+    pub build_sweep_every: Duration,
 }
 
 impl HubOptions {
@@ -195,6 +201,8 @@ impl HubOptions {
             lease_stuck_look_ms: crate::hub::leases::STUCK_LOOK_MS,
             build_budget: crate::budget::BudgetConfig::off(),
             budget_sample_every: crate::budget::SAMPLE_EVERY,
+            build_sweep: crate::sweep::SweepConfig::off(),
+            build_sweep_every: crate::sweep::CHECK_EVERY,
         }
     }
 }
@@ -642,6 +650,8 @@ pub struct Hub {
     telemetry: Arc<crate::telemetry::Telemetry>,
     /// The compile-job pool sessions share (see [`crate::budget`]).
     budget: crate::budget::BuildBudget,
+    /// Build sweeps: one at a time, the last one (see [`crate::sweep`]).
+    sweep: sweep::SweepRuntime,
     /// How far each watch has looked in the log (see [`crate::watch`]).
     watches: crate::watch::Engine,
     /// Leases on named resources (see [`crate::leases`]).
@@ -766,6 +776,7 @@ impl Hub {
         Ok(Arc::new(Self {
             telemetry,
             budget,
+            sweep: sweep::SweepRuntime::load(&options.state_dir),
             watches: crate::watch::Engine::default(),
             leases: leases::LeaseRuntime::open(&options.state_dir),
             reviews: crate::reviews::ReviewStore::new(&options.state_dir),

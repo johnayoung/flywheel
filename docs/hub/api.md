@@ -71,7 +71,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs`, `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`, `stale`, `never_relaunch`, `no_build_budget`,
+A session lists `agent` (`state`, `detail`, `since`, `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs`, `start_sessions`, `start_policy`, `start_requests`, `starts_made`, `stale`, `never_relaunch`, `no_build_budget`,
 `owner`, `ending`, `ended`, `end_requests`, `labels`, `leases`; queue items: `from`, `priority`. `label`: `k=v\|w,k2` (all hold).
 
 ## Review, handoff, peer review
@@ -159,7 +159,7 @@ Fan-outs off: 503.
 | PUT | `/api/digest/config` | `{"times"?,"timezone"?,"channels"?,"quiet_if_empty"?,"rev"?}` (omitted: kept; `timezone:""`: system) -> rewrites hub.toml `[digest]`; 422; 409 stale `rev` |
 | GET | `/api/digests/{id}` | one of the last 14 |
 
-Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, prefix, or name. `kind`: comma list (`review` = `review.*`); beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer or `machines=none`: this hub alone.
+Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, prefix, or name. `kind`: comma list (`review` = `review.*`); beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`, `build.swept`, `build.sweep_short`. A peer or `machines=none`: this hub alone.
 
 ## Settings, config, plugins, notify, TLS
 
@@ -203,7 +203,8 @@ Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a
 | POST | `/api/machines/{name}/test` | ok, latency, its `whoami` or error |
 | any | `/m/{name}/{*rest}` | proxy to machine `name`'s API and sockets |
 | GET | `/api/events[?client=ID&after=CURSOR]` | events WebSocket (below) |
-| GET | `/api/budget` | `pool`? (`free`, `in_use`, `cargo`, `ceiling`, `sessions`), `pressure`?, `constraint`, `fleet`: hubs' last `budget.sample` |
+| GET | `/api/budget` | `pool`?, `pressure`?, `constraint`, `disks`, `sweep` (`last`?), `fleet`: hubs' last `budget.sample` |
+| POST | `/api/sweep` | `{"all"?,"dry_run"?}` -> what `fw hub sweep --json` prints |
 | GET | `/api/log` | `after`, `filter`, `session`, `ws`, `state`, `kind`, `label`, `host`, `limit`, `wait` (s) -> `events` (`cursor`, `kind`, `state`?, `body`), `cursor`, `more`; 400 foreign cursor |
 
 ## Pages (no `/api`)
@@ -265,7 +266,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: runs as `batches`; `batch=KEY`: its runs |
+| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: `batches`; `batch=KEY`: its runs |
 | GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`), `total`, `placed`, `runs` |
 | GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `waiting`, `failing`, `rewritten`, `context` |
 | GET | `/api/telemetry/capture/hooks` | what `capture install` writes |
@@ -282,7 +283,7 @@ Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`
 Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `compacting`, `working`, `background`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
 
 Kinds: `session.started`, `session.continued`, `session.end_requested`, `session.end_cancelled`, `session.ended`, `session.replaced`, `session.owner_changed`, `session.relaunched` (`why`, `error`?), `queue.cancelled`, `session.finished`,
-`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`, `labels.changed` (`set`, `before`), `hub` (logged under its own name: a plugin event, `budget.sample`).
+`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`, `labels.changed` (`set`, `before`), `hub` (by name: plugin events, `budget.sample`, `build.swept`).
 
 ## Events WebSocket
 

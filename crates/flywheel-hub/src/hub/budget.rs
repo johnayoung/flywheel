@@ -29,8 +29,24 @@ pub struct BudgetView {
     pub host: String,
     #[serde(flatten)]
     pub reading: Reading,
+    /// The filesystems the workspace folders are on (see
+    /// [`crate::sweep`]).
+    pub disks: Vec<crate::sweep::disk::DiskUse>,
+    /// `[build_sweep]`: whether it sweeps by itself, and its watermarks.
+    pub sweep: SweepView,
     /// Every other hub that reported a sample here lately.
     pub fleet: Vec<HostSample>,
+}
+
+/// The build sweep in the budget reading.
+#[derive(Debug, Clone, Serialize)]
+pub struct SweepView {
+    pub enabled: bool,
+    pub high_watermark: u8,
+    pub low_watermark: u8,
+    /// The last sweep that ran (deleting or not).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last: Option<crate::sweep::LastSweep>,
 }
 
 impl Hub {
@@ -67,7 +83,10 @@ impl Hub {
                     }
                     let (reading, due) = hub.budget.tick();
                     if due {
-                        hub.log_hub_event(SAMPLE_EVENT, None, crate::budget::sample_body(&reading));
+                        let mut body = crate::budget::sample_body(&reading);
+                        body["disks"] = serde_json::to_value(hub.workspace_disks())
+                            .unwrap_or(serde_json::Value::Null);
+                        hub.log_hub_event(SAMPLE_EVENT, None, body);
                     }
                 }
             });
@@ -102,9 +121,17 @@ impl Hub {
             .filter(|(from, _, _)| *from != host)
             .map(|(host, ts, sample)| HostSample { host, ts, sample })
             .collect();
+        let config = self.options.build_sweep;
         BudgetView {
             host,
             reading,
+            disks: self.workspace_disks(),
+            sweep: SweepView {
+                enabled: config.enabled,
+                high_watermark: config.high_watermark,
+                low_watermark: config.low_watermark,
+                last: self.last_sweep(),
+            },
             fleet,
         }
     }

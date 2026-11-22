@@ -400,7 +400,7 @@ impl Hub {
     }
 
     /// Write `draft` and announce the row.
-    fn write_activity(&self, draft: Draft) {
+    pub(crate) fn write_activity(&self, draft: Draft) {
         if let Some(row) = self.activity().record(draft) {
             self.emit(HubEvent::Activity {
                 row: serde_json::to_value(&row).unwrap_or(Value::Null),

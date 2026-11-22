@@ -100,6 +100,7 @@ mod sessions_api;
 mod settings_api;
 mod share_api;
 mod slots;
+mod sweep_api;
 mod telemetry_api;
 mod templates_api;
 mod terminal_ws;
@@ -306,6 +307,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/log", get(log_api::read_log))
         .route("/api/budget", get(budget_api::get_budget))
+        .route("/api/sweep", axum::routing::post(sweep_api::sweep))
         .route(
             "/api/watches",
             get(watches_api::list_watches).post(watches_api::add_watch),

@@ -37,6 +37,7 @@ window.FwHubActivity = function (ctx) {
     ["share,record", "shares and recordings"],
     ["plugin", "plugins"],
     ["hub", "hub"],
+    ["build", "build sweeps"],
   ];
   // The tag each kind's rows carry (the timeline's left column).
   const TAG = {
@@ -48,6 +49,8 @@ window.FwHubActivity = function (ctx) {
     "handoff.sent": "handoff",
     "broadcast.sent": "broadcast",
     "plugin.ran": "plugin",
+    "build.swept": "swept",
+    "build.sweep_short": "disk",
   };
 
   const ui = {

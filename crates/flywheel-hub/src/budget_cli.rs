@@ -119,6 +119,37 @@ pub(crate) fn print_budget(out: &mut dyn Write, view: &Value) {
         pressure_line(&view["pressure"]),
         str_field(view, "constraint"),
     );
+    let sweep = &view["sweep"];
+    for disk in view["disks"].as_array().map_or(&[][..], Vec::as_slice) {
+        let _ = writeln!(
+            out,
+            "disk {}; sweeps at {}% down to {}%{}",
+            crate::sweep_cli::disk_line(disk),
+            num(sweep, "high_watermark"),
+            num(sweep, "low_watermark"),
+            if sweep["enabled"] == true {
+                ""
+            } else {
+                " (automatic sweeps off)"
+            },
+        );
+    }
+    let last = &sweep["last"];
+    if last.is_object() {
+        let _ = writeln!(
+            out,
+            "last build sweep {} ({}): {} target/ dirs, {} reclaimed{}",
+            str_field(last, "at"),
+            str_field(last, "by"),
+            num(last, "deleted"),
+            crate::util::human_bytes(num(last, "reclaimed_bytes")),
+            if last["short"] == true {
+                "; nothing more was eligible"
+            } else {
+                ""
+            },
+        );
+    }
     let fleet = view["fleet"].as_array().map_or(&[][..], Vec::as_slice);
     if !fleet.is_empty() {
         let _ = writeln!(out, "other hubs (last sample):");

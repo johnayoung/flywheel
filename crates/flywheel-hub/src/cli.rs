@@ -240,6 +240,10 @@ enum HubCommand {
     /// use, which sessions hold them), the machine's CPU, I/O wait,
     /// memory, and swap, what bounds it, and other hubs' last samples.
     Budget(crate::budget_cli::BudgetArgs),
+    /// The build sweep: delete the target/ dirs of worktrees nobody uses
+    /// (merged and idle, or stale), never anything else; --dry-run lists
+    /// them and why each other one is kept; --keep PATH marks one kept.
+    Sweep(crate::sweep_cli::SweepArgs),
     /// Review records: record a verdict on BASE..HEAD, ls them (by repo
     /// or commit), check that a range is covered by READY reviews (exit 1
     /// when not), retract one (operator).
@@ -811,6 +815,7 @@ fn dispatch_verb(
         HubCommand::Capture(args) => crate::capture_cli::main(&args, out, err),
         HubCommand::Insights(args) => crate::insights_cli::insights(&args, out, err),
         HubCommand::Budget(args) => crate::budget_cli::budget(&args, out, err),
+        HubCommand::Sweep(args) => crate::sweep_cli::sweep(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),

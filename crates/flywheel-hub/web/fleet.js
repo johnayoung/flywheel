@@ -29,7 +29,8 @@
 //
 // The header reads the build budget (GET /api/budget, `fw hub budget`):
 // build slots in use of the shared compile pool, the machine's CPU, I/O
-// wait, and free memory, and what bounds it; every 5 s while open.
+// wait, and free memory, and what bounds it; each workspace disk's use
+// and the last build sweep's reclaimed bytes; every 5 s while open.
 //
 // Insights say where time and money went (GET /api/telemetry/insights,
 // `fw hub insights`): per project, tool time by command, polling, what
@@ -937,7 +938,17 @@ window.FwHubFleet = function (ctx) {
       if (p.swap_out_pages_per_sec > 0) bits.push(` · swapping ${Math.round(p.swap_out_pages_per_sec)} pages/s`);
     }
     bits.push(" · bound by ", el("span", { className: `fl-bound ${view.constraint}`, textContent: view.constraint }));
+    const sweep = view.sweep || {};
+    const size = (n) => n >= 2 ** 40 ? `${(n / 2 ** 40).toFixed(1)} TiB` : `${(n / 2 ** 30).toFixed(1)} GiB`;
+    for (const d of view.disks || []) {
+      const hot = d.used_pct >= sweep.high_watermark;
+      bits.push(" · disk ", el("span", { className: `fl-disk${hot ? " hot" : ""}`, textContent: `${d.mount || d.path} ${Math.round(d.used_pct)}%` }), ` ${size(d.free_bytes)} free`);
+    }
+    const last = sweep.last;
+    if (last) bits.push(` · last sweep ${size(last.reclaimed_bytes)}`);
     const title = [];
+    if (sweep.high_watermark) title.push(`build sweep: ${sweep.enabled ? "automatic" : "fw hub sweep only"}, at ${sweep.high_watermark}% down to ${sweep.low_watermark}%`);
+    if (last) title.push(`last sweep ${new Date(last.at).toLocaleString()} (${last.by}): ${last.deleted} target/ dirs, ${size(last.reclaimed_bytes)}${last.short ? "; nothing more was eligible" : ""}`);
     if (pool) {
       title.push(`${pool.tokens - pool.free} of ${pool.tokens} tokens taken, ${pool.cargo} building cargo (one slot each), ${pool.rustc} rustc`);
       for (const use of pool.sessions || []) {

@@ -159,8 +159,8 @@ Matches within `--window` (3 s), or while that prompt waits, join it (40 listed)
 
 What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: digest, then timeline; `--since last-seen`: since this CLI last looked).
 
-- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object or attaches.
-- **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths; token-shaped words: `[redacted]`.
+- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`, `build.swept`, `build.sweep_short`. A row opens its object or attaches.
+- **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths (but a swept worktree's); token-shaped words: `[redacted]`.
 - **Event log** (`fw hub tail [-f]`): every telemetry, label, and hub event (the rows above, `status.changed`, `queue.*`, `decision.made`, `flywheel.changed`) in arrival order, 30 days, by opaque cursor; a collector's holds every hub's.
 - **Filters** (FILTER: `state=done|failed children=lead team=web kind=review`): session, ws, state (events that moved a session there), labels (now, or either side of a change), kind or family. `fw hub wait --fleet FILTER` blocks for one.
 - **While you were away** (10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged; silent: `partial`.
@@ -169,7 +169,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days; `eval=` or `fw.eval=` labelled sessions are kept) and folded into what it is doing now.
 
-- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**; header: build slots, the machine's bound (`fw hub budget`).
+- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**; header: build slots, the machine's bound, disk use, the last sweep (`fw hub budget`).
 - **Needs you** (sidebar, `fw hub inbox`, `fw hub holds`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row, with its context. Holds: kind (`needs_input` `awaiting_approval` `permission` `gate`) + cause; alike ones fold into one row, answered at once. Answers kept: `fw hub decisions`.
 - **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
 - **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions); `session_status` reads one. Children report via a `children` watch; a waiting lead: `background`. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask`, `allowed`, `off`; `[agent_starts]` limits; `fw hub new` inside an agent obeys it.

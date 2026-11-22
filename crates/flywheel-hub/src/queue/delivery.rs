@@ -25,6 +25,7 @@ impl Hub {
         self.start_watches();
         self.start_leases();
         self.start_budget();
+        self.start_sweep();
         let weak = Arc::downgrade(self);
         let wakeup = Arc::clone(&self.queue_runtime().wakeup);
         let spawned = std::thread::Builder::new()

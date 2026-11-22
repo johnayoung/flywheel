@@ -11,6 +11,7 @@
 .fl-budget b { color: var(--ink-2); font-weight: 700; }
 .fl-budget .fl-bound { color: var(--brass); }
 .fl-budget .fl-bound.none { color: var(--ink-3); }
+.fl-budget .fl-disk.hot { color: var(--brass); font-weight: 700; }
 
 /* --- the status filter ------------------------------------------------------ */
 .fl-filters:empty { display: none; }

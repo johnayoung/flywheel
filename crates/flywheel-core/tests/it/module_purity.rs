@@ -1,9 +1,9 @@
 //! `task` and `lifecycle` must stay pure: no filesystem, IO, or environment
 //! access.
 
-const TASK_SRC: &str = include_str!("../src/task.rs");
-const LIFECYCLE_SRC: &str = include_str!("../src/lifecycle.rs");
-const ENVELOPE_SRC: &str = include_str!("../src/envelope.rs");
+const TASK_SRC: &str = include_str!("../../src/task.rs");
+const LIFECYCLE_SRC: &str = include_str!("../../src/lifecycle.rs");
+const ENVELOPE_SRC: &str = include_str!("../../src/envelope.rs");
 
 const FORBIDDEN: &[&str] = &[
     "std::fs",

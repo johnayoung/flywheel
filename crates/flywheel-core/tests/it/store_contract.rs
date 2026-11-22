@@ -10,8 +10,7 @@
 //!
 //! The Postgres cases skip, with a message, only when Docker is unavailable.
 
-#[path = "support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

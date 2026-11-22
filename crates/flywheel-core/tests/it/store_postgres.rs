@@ -12,8 +12,7 @@
 //! `support/pg_container.rs` and skips, with a message, when Docker is
 //! unavailable.
 
-#[path = "support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier, Mutex};
@@ -261,7 +260,9 @@ fn seed_v12(pg: &Postgres, schema: &str) {
         .unwrap();
     let mut admin = pg.admin_in(schema);
     admin
-        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v12.sql"))
+        .batch_execute(include_str!(
+            "../fixtures/persistence-schema-postgres-v12.sql"
+        ))
         .unwrap();
     admin
         .batch_execute(
@@ -373,7 +374,9 @@ fn seed_v13(pg: &Postgres, schema: &str) {
         .unwrap();
     let mut admin = pg.admin_in(schema);
     admin
-        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v13.sql"))
+        .batch_execute(include_str!(
+            "../fixtures/persistence-schema-postgres-v13.sql"
+        ))
         .unwrap();
     admin
         .batch_execute(
@@ -487,7 +490,9 @@ fn seed_v14(pg: &Postgres, schema: &str) {
         .unwrap();
     let mut admin = pg.admin_in(schema);
     admin
-        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v14.sql"))
+        .batch_execute(include_str!(
+            "../fixtures/persistence-schema-postgres-v14.sql"
+        ))
         .unwrap();
     admin
         .batch_execute(

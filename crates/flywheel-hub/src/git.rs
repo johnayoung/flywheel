@@ -184,6 +184,37 @@ fn git_ok(dir: &Path, args: &[&str]) -> bool {
     git(dir, args).is_ok()
 }
 
+/// `git -C dir args...` as an answer: `Ok(true, stdout)` on exit 0,
+/// `Ok(false, _)` on exit 1 (a "no" from `merge-base --is-ancestor`,
+/// `symbolic-ref -q`), `Err` for anything else (git missing, timed out,
+/// killed, or a real failure) -- where "no" and "broken" must not blur.
+pub fn git_answer(dir: &Path, args: &[&str]) -> Result<(bool, String), String> {
+    let mut full = vec!["-C".to_owned(), dir.to_string_lossy().into_owned()];
+    full.extend(args.iter().map(|a| (*a).to_owned()));
+    let output = runner::run(&runner::Spec {
+        program: "git",
+        dir: Path::new("/"),
+        args: full,
+        stdin: None,
+        timeout: GIT_TIMEOUT,
+        limit: GIT_OUTPUT_LIMIT,
+    })
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    match output.code {
+        Some(0) => Ok((true, output.stdout_text().trim_end().to_owned())),
+        Some(1) => Ok((false, String::new())),
+        _ if output.timed_out => Err(format!("git {} timed out", args.join(" "))),
+        code => {
+            let message = output.error_text().replace('\n', "; ");
+            Err(if message.is_empty() {
+                format!("git {} failed ({code:?})", args.join(" "))
+            } else {
+                message
+            })
+        }
+    }
+}
+
 /// Check a task name: it becomes a directory and (after the prefix) a
 /// branch, so letters, digits, `.`, `_`, `-` only, starting with a letter
 /// or digit, at most [`MAX_TASK_CHARS`].

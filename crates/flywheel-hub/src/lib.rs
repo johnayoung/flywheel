@@ -27,6 +27,7 @@ pub mod broadcast;
 pub mod broadcast_cli;
 pub mod browser;
 pub mod budget;
+pub mod sweep;
 mod budget_cli;
 mod capture_cli;
 mod change_cli;

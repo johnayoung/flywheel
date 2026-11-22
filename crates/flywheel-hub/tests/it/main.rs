@@ -31,6 +31,7 @@ mod settings;
 mod share;
 mod stalled_readers;
 mod status;
+mod sweep;
 mod telemetry;
 mod tls;
 mod watches;

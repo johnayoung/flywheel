@@ -1,0 +1,1201 @@
+//! Prompt queues end to end: real hubs on 127.0.0.1:0, a stand-in
+//! `claude` in a real PTY that logs every byte typed into it (raw mode,
+//! bracketed paste on, as the real TUI runs), and its status driven the
+//! way Claude Code's hooks drive it -- reports over the real report
+//! socket. Ordering, triggers, pause, never while blocked or typed into,
+//! holds, stalls, exactly-once across a restart (reconciled from the
+//! transcript), and a queue on another machine through the proxy.
+
+use crate::support;
+
+use flywheel_hub::agent::claude_project_dir_name;
+use flywheel_hub::report::{self, Report};
+use flywheel_hub::{Hub, HubEvent, HubOptions, ServerOptions, serve};
+use futures_util::SinkExt;
+use reqwest::StatusCode;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, oneshot};
+use tokio::time::{Instant, sleep, timeout};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+const WAIT: Duration = Duration::from_secs(60);
+/// The quiet window these hubs use (`queue.typing_quiet`).
+const QUIET: Duration = Duration::from_secs(2);
+/// Long enough for the hub to have delivered if it were going to: the
+/// settle time, a few looks, and the paste's Enter.
+const WOULD_HAVE: Duration = Duration::from_millis(3000);
+
+/// A stand-in `claude`: per hub session, its argv (`claude-<id>.argv`,
+/// NUL-separated), environment (`.env`), and every byte typed into it
+/// (`.in`, appended across relaunches), in raw mode with bracketed paste.
+///
+/// With a `draft` file in `log` when it starts, it also draws Claude
+/// Code's prompt box holding that file's text (unsent text in its input
+/// line), and draws the box empty -- its dim placeholder only -- once a
+/// `claude-<id>.sent` file appears.
+fn fake_claude(bin: &Path, log: &Path) -> PathBuf {
+    let path = bin.join("claude");
+    let rule = "\u{2500}".repeat(100);
+    support::write_script(
+        &path,
+        &format!(
+            "#!/bin/sh\nn='{log}/claude-'\"$FLYWHEEL_HUB_SESSION\"\n\
+             for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$n.argv\"\n\
+             env > \"$n.env.tmp\" && mv \"$n.env.tmp\" \"$n.env\"\n\
+             stty raw -echo\nprintf '\\033[?2004h'\n\
+             box() {{ printf '\\033[2J\\033[H\\r\\n{rule}\\r\\n\u{276f} %s\\r\\n{rule}\\r\\n  ? for shortcuts' \"$1\"; }}\n\
+             if [ -f '{log}/draft' ]; then\n\
+             box \"$(cat '{log}/draft')\"\n\
+             ( while [ ! -e \"$n.sent\" ]; do sleep 0.05; done\n\
+             box \"$(printf '\\033[2mTry \"fix lint errors\"\\033[0m')\" ) &\n\
+             fi\n\
+             exec cat >> \"$n.in\"\n",
+            log = log.display()
+        ),
+    );
+    path
+}
+
+/// How long a delivered prompt may go without a turn here.
+const ACK: Duration = Duration::from_secs(4);
+
+/// What the hub types for one delivered prompt.
+fn pasted(text: &str) -> Vec<u8> {
+    let mut bytes = flywheel_hub::pty::paste_bytes(text, true);
+    bytes.push(b'\r');
+    bytes
+}
+
+struct TestHub {
+    dir: Option<tempfile::TempDir>,
+    root: PathBuf,
+    addr: SocketAddr,
+    hub: Arc<Hub>,
+    http: reqwest::Client,
+    stop: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl TestHub {
+    async fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["repo/.git", "bin", "log"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        Self::open(dir, root).await
+    }
+
+    async fn open(dir: tempfile::TempDir, root: PathBuf) -> Self {
+        Self::open_with(dir, root, flywheel_hub::queue::ACK_TIMEOUT).await
+    }
+
+    /// A hub whose delivered prompts wait `ack` for a turn.
+    async fn start_with(ack: Duration) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["repo/.git", "bin", "log"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        Self::open_with(dir, root, ack).await
+    }
+
+    async fn open_with(dir: tempfile::TempDir, root: PathBuf, ack: Duration) -> Self {
+        flywheel_hub::install_crypto_provider();
+        let mut options = HubOptions::new(root.join("state"));
+        options.default_shell = vec!["/bin/sh".into()];
+        options.agents.claude = fake_claude(&root.join("bin"), &root.join("log"))
+            .to_string_lossy()
+            .into_owned();
+        options.agents.codex = root.join("bin/no-codex").to_string_lossy().into_owned();
+        options.report_command = Some(vec!["/opt/flywheel/bin/fw".into(), "hub".into()]);
+        options.claude_config_dir = Some(root.join("claude-config"));
+        options.queue_typing_quiet = QUIET;
+        options.queue_ack_timeout = ack;
+        let hub = support::open_hub(options);
+        hub.restore_sessions();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(
+            listener,
+            Arc::clone(&hub),
+            ServerOptions::default(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        Self {
+            dir: Some(dir),
+            root,
+            addr,
+            hub,
+            http: reqwest::Client::new(),
+            stop: Some(stop),
+            server: Some(server),
+        }
+    }
+
+    /// Stop gracefully and open a new hub over the same state dir (its
+    /// sessions restored, agents resumed).
+    async fn restart(mut self) -> Self {
+        let dir = self.dir.take().unwrap();
+        let root = self.root.clone();
+        let _ = self.stop.take().unwrap().send(());
+        timeout(WAIT, self.server.take().unwrap())
+            .await
+            .expect("server shut down in time")
+            .unwrap()
+            .unwrap();
+        drop(self);
+        Self::open(dir, root).await
+    }
+
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = self
+            .http
+            .request(method, format!("http://{}{path}", self.addr))
+            .bearer_auth(self.hub.token().expose());
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Value {
+        let (status, value) = self.call(reqwest::Method::POST, path, Some(body)).await;
+        assert!(status.is_success(), "{path}: {status} {value}");
+        value
+    }
+
+    async fn get(&self, path: &str) -> Value {
+        let (status, value) = self.call(reqwest::Method::GET, path, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {value}");
+        value
+    }
+
+    /// A claude session in a fresh workspace, its transcript started (so
+    /// a restart resumes it), and its stand-in up.
+    async fn claude(&self) -> Agent {
+        let ws = self
+            .post(
+                "/api/workspaces",
+                json!({ "name": format!("ws-{}", rand_tag()), "folders": [self.root.join("repo")] }),
+            )
+            .await;
+        let session = self
+            .post(
+                "/api/sessions",
+                json!({ "workspace_id": ws["id"], "kind": "claude", "cols": 100, "rows": 30 }),
+            )
+            .await;
+        let id = session["id"].as_str().unwrap().to_owned();
+        let conversation = session["agent_session_id"].as_str().unwrap().to_owned();
+        let project = self
+            .root
+            .join("claude-config/projects")
+            .join(claude_project_dir_name(&self.root.join("repo")));
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join(format!("{conversation}.jsonl"));
+        std::fs::write(&transcript, "").unwrap();
+        let agent = Agent {
+            id,
+            log: self.root.join("log"),
+            transcript,
+        };
+        agent.env(None).await;
+        agent
+    }
+
+    async fn queue(&self, sid: &str) -> Value {
+        self.get(&format!("/api/sessions/{sid}/queue")).await
+    }
+
+    async fn add(&self, sid: &str, text: &str, when: Option<&str>) -> Value {
+        self.post(
+            &format!("/api/sessions/{sid}/queue"),
+            json!({ "text": text, "when": when }),
+        )
+        .await
+    }
+
+    async fn session(&self, sid: &str) -> Value {
+        self.get("/api/sessions").await["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == sid)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    async fn ws(
+        &self,
+        path: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut request = format!("ws://{}{path}", self.addr)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.hub.token().expose())
+                .parse()
+                .unwrap(),
+        );
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+}
+
+fn rand_tag() -> String {
+    flywheel_hub::state::new_id()[..8].to_owned()
+}
+
+/// One stand-in agent session.
+struct Agent {
+    id: String,
+    log: PathBuf,
+    transcript: PathBuf,
+}
+
+impl Agent {
+    fn path(&self, ext: &str) -> PathBuf {
+        self.log.join(format!("claude-{}.{ext}", self.id))
+    }
+
+    /// The current spawn's environment (a different secret than
+    /// `previous`: a relaunch's).
+    async fn env(&self, previous: Option<&str>) -> HashMap<String, String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(self.path("env")) {
+                let env: HashMap<String, String> = text
+                    .lines()
+                    .filter_map(|l| l.split_once('='))
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect();
+                if env
+                    .get(report::SECRET_ENV)
+                    .is_some_and(|s| Some(s.as_str()) != previous)
+                {
+                    return env;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "claude {} never started",
+                self.id
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Run the hook for `event` the way Claude Code does.
+    async fn fire(&self, event: &str, detail: Option<&str>) {
+        let env = self.env(None).await;
+        report::send(
+            Path::new(&env[report::SOCKET_ENV]),
+            &Report {
+                session: env[report::SESSION_ENV].clone(),
+                secret: env[report::SECRET_ENV].clone(),
+                source: "claude".into(),
+                event: event.into(),
+                detail: detail.map(str::to_owned),
+                payload: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A finished turn: the prompt was taken (working), then done.
+    async fn turn(&self) {
+        self.fire("UserPromptSubmit", None).await;
+        sleep(Duration::from_millis(50)).await;
+        self.fire("Stop", None).await;
+    }
+
+    fn typed(&self) -> Vec<u8> {
+        std::fs::read(self.path("in")).unwrap_or_default()
+    }
+
+    /// Wait until exactly `want` has been typed into it.
+    async fn typed_becomes(&self, want: &[u8]) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let got = self.typed();
+            if got == want {
+                return;
+            }
+            assert!(
+                want.starts_with(&got) && Instant::now() < deadline,
+                "typed {:?}, want {:?}",
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(want)
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Nothing more than `want` is typed in [`WOULD_HAVE`].
+    async fn stays(&self, want: &[u8]) {
+        sleep(WOULD_HAVE).await;
+        assert_eq!(
+            String::from_utf8_lossy(&self.typed()),
+            String::from_utf8_lossy(want),
+            "typed while it should have waited"
+        );
+    }
+}
+
+/// Wait for status `want` on the hub (the stand-in's reports are applied
+/// asynchronously).
+async fn status_is(hub: &TestHub, sid: &str, want: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if hub.session(sid).await["agent"]["status"] == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{sid} never became {want}");
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The next plugin lifecycle event `name`'s payload.
+async fn lifecycle(events: &mut broadcast::Receiver<HubEvent>, name: &str) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, events.recv()).await {
+            Ok(Ok(HubEvent::Lifecycle { event, payload })) if event == name => return payload,
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
+            other => panic!("no {name} event: {other:?}"),
+        }
+    }
+}
+
+fn texts(view: &Value, state: &str) -> Vec<String> {
+    view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["state"] == state)
+        .map(|i| i["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_prompts_go_one_finished_turn_at_a_time_in_order() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    let mut events = hub.hub.subscribe();
+    agent.fire("UserPromptSubmit", None).await;
+    status_is(&hub, &agent.id, "working").await;
+
+    hub.add(&agent.id, "first: write the tests", None).await;
+    hub.add(&agent.id, "second: make them pass", Some("done"))
+        .await;
+    let added = hub.add(&agent.id, "zeroth: read the spec", None).await;
+    assert_eq!(added["queue"]["pending"], 3);
+    assert_eq!(added["item"]["when"], "done");
+    // The third goes to the front.
+    let third = added["item"]["id"].as_str().unwrap().to_owned();
+    let moved = hub
+        .post(
+            &format!(
+                "/api/sessions/{}/queue/items/{}/move",
+                agent.id,
+                &third[..8]
+            ),
+            json!({ "position": 1 }),
+        )
+        .await;
+    assert_eq!(
+        texts(&moved, "pending"),
+        [
+            "zeroth: read the spec",
+            "first: write the tests",
+            "second: make them pass"
+        ]
+    );
+    assert!(
+        moved["waiting"].as_str().unwrap().contains("working"),
+        "{moved}"
+    );
+    // The row and the list both count it.
+    assert_eq!(hub.session(&agent.id).await["queue"]["pending"], 3);
+
+    // Never while the turn runs.
+    agent.stays(b"").await;
+
+    // Done: the head goes, alone.
+    agent.fire("Stop", None).await;
+    let mut want = pasted("zeroth: read the spec");
+    agent.typed_becomes(&want).await;
+    let delivered = lifecycle(&mut events, "queue.delivered").await;
+    assert_eq!(delivered["session"]["id"], agent.id.as_str());
+    assert_eq!(delivered["item"]["text"], "zeroth: read the spec");
+    assert_eq!(delivered["pending"], 2);
+    let view = hub.queue(&agent.id).await;
+    assert_eq!(texts(&view, "delivered"), ["zeroth: read the spec"]);
+    assert!(view["items"][0]["delivered_at"].is_string(), "{view}");
+    assert!(
+        view["waiting"].as_str().unwrap().contains("take up"),
+        "{view}"
+    );
+    // The agent is still at rest from before the delivery: the next one
+    // waits for the turn the delivered prompt starts to finish.
+    agent.stays(&want).await;
+
+    agent.turn().await;
+    want.extend(pasted("first: write the tests"));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("second: make them pass"));
+    agent.typed_becomes(&want).await;
+    for text in ["first: write the tests", "second: make them pass"] {
+        assert_eq!(
+            lifecycle(&mut events, "queue.delivered").await["item"]["text"],
+            text
+        );
+    }
+    // Emptied: nothing more goes on the next turn.
+    agent.turn().await;
+    agent.stays(&want).await;
+    let view = hub.queue(&agent.id).await;
+    assert_eq!(view["pending"], 0);
+    assert_eq!(texts(&view, "delivered").len(), 3);
+    assert_eq!(hub.session(&agent.id).await["queue"]["pending"], 0);
+
+    // Edits and removals keep to pending items; a shell has no queue.
+    // Paused first: the finished turn would take an item added to a
+    // running queue at its next tick.
+    hub.post(
+        &format!("/api/sessions/{}/queue/pause", agent.id),
+        json!({}),
+    )
+    .await;
+    let item = hub.add(&agent.id, "typo", None).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, edited) = hub
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/api/sessions/{}/queue/items/{item}", agent.id),
+            Some(json!({ "text": "fixed", "when": "idle" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(texts(&edited, "pending"), ["fixed"]);
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}/queue/items/1", agent.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let cleared = hub
+        .post(
+            &format!("/api/sessions/{}/queue/clear", agent.id),
+            json!({ "all": true }),
+        )
+        .await;
+    assert_eq!(cleared["items"], json!([]));
+    let (status, refused) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{}/queue", agent.id),
+            Some(json!({ "text": "  " })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn never_while_blocked_and_blocked_cleared_waits_for_the_answer() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    agent.fire("UserPromptSubmit", None).await;
+    hub.add(&agent.id, "after the approval", None).await;
+    hub.add(&agent.id, "once you have asked me", Some("blocked-cleared"))
+        .await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    agent.stays(b"").await;
+    let view = hub.queue(&agent.id).await;
+    assert!(
+        view["waiting"].as_str().unwrap().contains("blocked"),
+        "{view}"
+    );
+
+    // Answered, the turn finishes: the first goes.
+    agent.fire("PreToolUse", None).await;
+    agent.fire("Stop", None).await;
+    let mut want = pasted("after the approval");
+    agent.typed_becomes(&want).await;
+
+    // blocked-cleared: a turn without a block does not release it.
+    agent.turn().await;
+    agent.stays(&want).await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("block on"),
+        "waits for a block"
+    );
+    agent.fire("UserPromptSubmit", None).await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    agent.stays(&want).await;
+    agent.fire("PreToolUse", None).await;
+    status_is(&hub, &agent.id, "working").await;
+    agent.stays(&want).await;
+    agent.fire("Stop", None).await;
+    want.extend(pasted("once you have asked me"));
+    agent.typed_becomes(&want).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn never_while_someone_types_and_idle_waits_for_a_look() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    agent.fire("SessionStart", None).await;
+    status_is(&hub, &agent.id, "idle").await;
+    // Settle the fresh status first, so only typing holds it back.
+    sleep(Duration::from_secs(2)).await;
+
+    // Someone types at the terminal: the queue holds off until they have
+    // been quiet for queue.typing_quiet.
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    let mut want = Vec::new();
+    for key in ["h", "e", "y"] {
+        term.send(Message::Text(
+            json!({ "type": "input", "data": key }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        want.extend(key.as_bytes());
+    }
+    let typed_at = Instant::now();
+    agent.typed_becomes(&want).await;
+    hub.add(&agent.id, "while you type", None).await;
+    let waiting = hub.queue(&agent.id).await["waiting"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(waiting.contains("typed"), "{waiting}");
+    // Keep typing for a while: still nothing.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(600)).await;
+        term.send(Message::Binary(b"!".to_vec().into()))
+            .await
+            .unwrap();
+        want.push(b'!');
+    }
+    agent.typed_becomes(&want).await;
+    assert!(typed_at.elapsed() > QUIET);
+    // Quiet now, but "hey!!!!" sits unsent in its input: pasting the
+    // prompt and Enter would send the two merged. It waits for that
+    // draft to be sent or cleared, however long that takes.
+    agent.stays(&want).await;
+    let waiting = hub.queue(&agent.id).await["waiting"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(waiting.contains("7 characters"), "{waiting}");
+    // Cleared with Backspace: the quiet window still applies from it.
+    for _ in 0..7 {
+        term.send(Message::Binary(b"\x7f".to_vec().into()))
+            .await
+            .unwrap();
+        want.push(0x7f);
+    }
+    let last_key = Instant::now();
+    agent.typed_becomes(&want).await;
+    want.extend(pasted("while you type"));
+    agent.typed_becomes(&want).await;
+    assert!(
+        last_key.elapsed() >= QUIET,
+        "delivered {:?} after the last key",
+        last_key.elapsed()
+    );
+    drop(term);
+
+    // idle: a finished turn nobody has looked at keeps it waiting.
+    agent.turn().await;
+    status_is(&hub, &agent.id, "done").await;
+    hub.add(&agent.id, "after you read it", Some("idle")).await;
+    agent.stays(&want).await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("looked"),
+        "waits for a look"
+    );
+    let mut viewer = hub.ws("/api/events?client=phone").await;
+    viewer
+        .send(Message::Text(
+            json!({ "type": "view", "session_id": agent.id })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    want.extend(pasted("after you read it"));
+    agent.typed_becomes(&want).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hubs_own_pastes_count_as_typing_and_a_draft_is_kept_across_an_answer() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    agent.fire("SessionStart", None).await;
+    status_is(&hub, &agent.id, "idle").await;
+    sleep(Duration::from_secs(2)).await;
+    // Paused before the item goes in: added to a running queue, the item
+    // is deliverable at once and the next tick could send it before a
+    // pause landed.
+    hub.post(
+        &format!("/api/sessions/{}/queue/pause", agent.id),
+        json!({}),
+    )
+    .await;
+    hub.add(&agent.id, "queued meanwhile", None).await;
+    // A paste the hub makes (handoff, send findings, a plugin action, the
+    // paste API) types into the agent: the queue waits it out like keys.
+    hub.post(
+        &format!("/api/sessions/{}/paste", agent.id),
+        json!({ "text": "a handoff", "run": true }),
+    )
+    .await;
+    let pasted_at = Instant::now();
+    let mut want = pasted("a handoff");
+    agent.typed_becomes(&want).await;
+    let resumed = hub
+        .post(
+            &format!("/api/sessions/{}/queue/resume", agent.id),
+            json!({}),
+        )
+        .await;
+    assert!(
+        resumed["waiting"].as_str().unwrap().contains("typed"),
+        "{resumed}"
+    );
+    want.extend(pasted("queued meanwhile"));
+    agent.typed_becomes(&want).await;
+    assert!(pasted_at.elapsed() >= QUIET, "{:?}", pasted_at.elapsed());
+
+    // A paste without Enter leaves a draft: nothing goes on top of it.
+    agent.turn().await;
+    hub.add(&agent.id, "not onto a draft", None).await;
+    hub.post(
+        &format!("/api/sessions/{}/paste", agent.id),
+        json!({ "text": "half", "run": false }),
+    )
+    .await;
+    want.extend(flywheel_hub::pty::paste_bytes("half", true));
+    agent.typed_becomes(&want).await;
+    agent.stays(&want).await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("4 characters"),
+    );
+    // Cleared (Ctrl-U): it goes once the quiet window passes.
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(b"\x15".to_vec().into()))
+        .await
+        .unwrap();
+    want.push(0x15);
+    want.extend(pasted("not onto a draft"));
+    agent.typed_becomes(&want).await;
+
+    // Keys answering a permission prompt never reach the input line: not
+    // a draft, so the turn's end lets the next one go.
+    agent.fire("UserPromptSubmit", None).await;
+    hub.add(&agent.id, "after the answer", None).await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    term.send(Message::Binary(b"1".to_vec().into()))
+        .await
+        .unwrap();
+    want.push(b'1');
+    agent.typed_becomes(&want).await;
+    agent.fire("PreToolUse", None).await;
+    status_is(&hub, &agent.id, "working").await;
+    agent.fire("Stop", None).await;
+    want.extend(pasted("after the answer"));
+    agent.typed_becomes(&want).await;
+    drop(term);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_open_in_an_editor_waits_and_stall_events_carry_the_item() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    let mut events = hub.hub.subscribe();
+    agent.fire("UserPromptSubmit", None).await;
+    let added = hub.add(&agent.id, "being edited", None).await;
+    let item = added["item"]["id"].as_str().unwrap().to_owned();
+    let editing = format!("/api/sessions/{}/queue/items/{item}/editing", agent.id);
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &editing,
+            Some(json!({ "editing": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    agent.fire("Stop", None).await;
+    agent.stays(b"").await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("editor")
+    );
+    let (status, _) = hub
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/api/sessions/{}/queue/items/{item}", agent.id),
+            Some(json!({ "text": "edited" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    hub.post(&editing, json!({ "editing": false })).await;
+    let want = pasted("edited");
+    agent.typed_becomes(&want).await;
+    let delivered = lifecycle(&mut events, "queue.delivered").await;
+    assert_eq!(delivered["item"]["text"], "edited");
+
+    // queue.stalled names its item the same way.
+    agent.turn().await;
+    hub.add(&agent.id, "to a dead agent", Some("idle")).await;
+    hub.post(&format!("/api/sessions/{}/kill", agent.id), json!({}))
+        .await;
+    let stalled = lifecycle(&mut events, "queue.stalled").await;
+    assert_eq!(stalled["item"]["text"], "to a dead agent", "{stalled}");
+    assert_eq!(stalled["item"]["when"], "idle");
+    assert!(stalled["item"]["id"].is_string());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_resume_holds_and_stalls_that_surface() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    let mut events = hub.hub.subscribe();
+    agent.fire("UserPromptSubmit", None).await;
+    hub.add(&agent.id, "held back", None).await;
+    let paused = hub
+        .post(
+            &format!("/api/sessions/{}/queue/pause", agent.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(paused["paused"], true);
+    assert_eq!(hub.session(&agent.id).await["queue"]["paused"], true);
+    agent.fire("Stop", None).await;
+    agent.stays(b"").await;
+    hub.post(
+        &format!("/api/sessions/{}/queue/resume", agent.id),
+        json!({}),
+    )
+    .await;
+    let mut want = pasted("held back");
+    agent.typed_becomes(&want).await;
+
+    // A review action (or any holder) keeps it back while it runs.
+    agent.turn().await;
+    let held = hub
+        .hub
+        .hold_sessions(vec![agent.id.clone()], "a review merge");
+    hub.add(&agent.id, "after the merge", None).await;
+    agent.stays(&want).await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("a review merge is using the session"),
+    );
+    drop(held);
+    want.extend(pasted("after the merge"));
+    agent.typed_becomes(&want).await;
+
+    // The agent exits: the queue stalls, says why, and announces it.
+    agent.turn().await;
+    hub.add(&agent.id, "never typed into a dead agent", None)
+        .await;
+    hub.post(&format!("/api/sessions/{}/kill", agent.id), json!({}))
+        .await;
+    let stalled = lifecycle(&mut events, "queue.stalled").await;
+    assert!(
+        stalled["reason"].as_str().unwrap().contains("exited"),
+        "{stalled}"
+    );
+    assert_eq!(stalled["pending"], 1);
+    let row = hub.session(&agent.id).await;
+    assert!(
+        row["queue"]["stalled"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("exited"),
+        "{row}"
+    );
+    // Resumed while the agent is still gone, a prompt added says so at
+    // once: the answer carries the stall, not a pending item that never
+    // goes.
+    hub.post(
+        &format!("/api/sessions/{}/queue/resume", agent.id),
+        json!({}),
+    )
+    .await;
+    let added = hub.add(&agent.id, "and this one", None).await;
+    assert!(
+        added["queue"]["stalled"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("exited")),
+        "{added}"
+    );
+
+    // Relaunched, it goes once the new agent is at rest.
+    let previous = agent.env(None).await[report::SECRET_ENV].clone();
+    hub.post(&format!("/api/sessions/{}/restart", agent.id), json!({}))
+        .await;
+    agent.env(Some(&previous)).await;
+    // The relaunch the stall asked for clears it: no separate resume.
+    assert!(hub.queue(&agent.id).await["stalled"].is_null());
+    agent.stays(&want).await;
+    agent.fire("SessionStart", None).await;
+    want.extend(pasted("never typed into a dead agent"));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("and this one"));
+    agent.typed_becomes(&want).await;
+}
+
+/// Mark the first pending item with `text` as `sending` in the stopped
+/// hub's state file.
+fn mark_sending(state: &Path, sid: &str, text: &str) {
+    let path = state.join("state.json");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(doc["version"], 6);
+    let items = doc["queues"][sid]["items"].as_array_mut().unwrap();
+    let item = items.iter_mut().find(|i| i["text"] == text).unwrap();
+    item["state"] = json!("sending");
+    item["sending_at"] = json!(chrono::Utc::now().to_rfc3339());
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_delivers_each_prompt_exactly_once() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    agent.fire("UserPromptSubmit", None).await;
+    for text in ["went before it died", "never got there", "still to come"] {
+        hub.add(&agent.id, text, None).await;
+    }
+    let state = hub.root.join("state");
+    let before = agent.env(None).await[report::SECRET_ENV].clone();
+    let hub = {
+        // Stopped as if it died mid-delivery twice over: one paste reached
+        // the agent (its transcript has the prompt), one did not.
+        let root = hub.root.clone();
+        let mut hub = hub;
+        let tmp = hub.dir.take().unwrap();
+        let _ = hub.stop.take().unwrap().send(());
+        timeout(WAIT, hub.server.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(hub);
+        mark_sending(&state, &agent.id, "went before it died");
+        mark_sending(&state, &agent.id, "never got there");
+        let line = json!({
+            "type": "user",
+            "uuid": "u-1",
+            "sessionId": "c",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": { "role": "user", "content": "went before it died" },
+        });
+        std::fs::write(&agent.transcript, format!("{line}\n")).unwrap();
+        TestHub::open(tmp, root).await
+    };
+    // Settled on start: the first is delivered (from the transcript), the
+    // second pending again.
+    let view = hub.queue(&agent.id).await;
+    assert_eq!(texts(&view, "delivered"), ["went before it died"]);
+    assert_eq!(view["items"][0]["reconciled"], true);
+    assert_eq!(
+        texts(&view, "pending"),
+        ["never got there", "still to come"]
+    );
+
+    // Resumed (claude --resume), but nothing goes until it reports in.
+    agent.env(Some(&before)).await;
+    let argv = std::fs::read_to_string(agent.path("argv")).unwrap();
+    assert!(argv.starts_with("--resume\0"), "{argv:?}");
+    agent.stays(b"").await;
+    agent.fire("SessionStart", None).await;
+    let mut want = pasted("never got there");
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("still to come"));
+    agent.typed_becomes(&want).await;
+
+    // A clean restart with nothing in flight types nothing again.
+    hub.add(&agent.id, "after the restart", None).await;
+    let before = agent.env(None).await[report::SECRET_ENV].clone();
+    let hub = hub.restart().await;
+    agent.env(Some(&before)).await;
+    agent.stays(&want).await;
+    agent.fire("SessionStart", None).await;
+    want.extend(pasted("after the restart"));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    agent.stays(&want).await;
+    assert_eq!(texts(&hub.queue(&agent.id).await, "delivered").len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_on_another_machine_works_through_the_proxy() {
+    let b = TestHub::start().await;
+    let a = TestHub::start().await;
+    let agent = b.claude().await;
+    agent.fire("UserPromptSubmit", None).await;
+    let issued = b.post("/api/peers", json!({ "name": "hub-a" })).await;
+    a.post(
+        "/api/machines",
+        json!({ "name": "b", "url": format!("http://{}", b.addr), "credential": issued["credential"] }),
+    )
+    .await;
+
+    let added = a
+        .post(
+            &format!("/m/b/api/sessions/{}/queue", agent.id),
+            json!({ "text": "from the laptop", "when": "done" }),
+        )
+        .await;
+    assert_eq!(added["queue"]["pending"], 1);
+    // Kept by the hub that owns the session, shown on its row through A.
+    assert!(a.hub.queue_views().is_empty());
+    let listed = a.get("/m/b/api/sessions").await;
+    let row = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == agent.id.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(row["queue"]["pending"], 1);
+
+    agent.fire("Stop", None).await;
+    agent.typed_becomes(&pasted("from the laptop")).await;
+    let view = a
+        .get(&format!("/m/b/api/sessions/{}/queue", agent.id))
+        .await;
+    assert_eq!(texts(&view, "delivered"), ["from the laptop"]);
+    let paused = a
+        .post(
+            &format!("/m/b/api/sessions/{}/queue/pause", agent.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(paused["paused"], true);
+    assert_eq!(b.queue(&agent.id).await["paused"], true);
+}
+
+/// The live failure: a question dialog was up (blocked) while the operator
+/// typed, and Claude Code kept that text in its input line once the
+/// dialog closed. Keys typed while blocked never count as a draft, so the
+/// hub believed the line empty and typed a start notice onto it: one
+/// prompt, the two glued. The screen's input line is read before every
+/// delivery, and one holding text keeps it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_left_in_the_input_line_while_blocked_holds_every_delivery() {
+    let hub = TestHub::start().await;
+    let draft = "Is Wintermute doing LP activity?";
+    std::fs::create_dir_all(hub.root.join("log")).unwrap();
+    std::fs::write(hub.root.join("log/draft"), draft).unwrap();
+    let agent = hub.claude().await;
+    agent.fire("UserPromptSubmit", None).await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(draft.as_bytes().to_vec().into()))
+        .await
+        .unwrap();
+    let mut want = draft.as_bytes().to_vec();
+    agent.typed_becomes(&want).await;
+    drop(term);
+    agent.fire("PreToolUse", None).await;
+    status_is(&hub, &agent.id, "working").await;
+    agent.fire("Stop", None).await;
+    status_is(&hub, &agent.id, "done").await;
+    // At rest, settled, nobody typing: all that keeps a delivery back is
+    // the text in the input line.
+    sleep(QUIET + Duration::from_millis(500)).await;
+
+    // A notice sent now (a start approved, a message from another agent)
+    // is queued, not typed onto the draft.
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    let sent = tokio::task::spawn_blocking(move || {
+        sender.send_or_queue(&id, "From the flywheel hub: the operator started it.")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let sent = serde_json::to_value(&sent).unwrap();
+    assert_eq!(sent["delivery"], "queued", "{sent}");
+    assert!(
+        sent["why"].as_str().unwrap().contains("32 characters"),
+        "{sent}"
+    );
+    // So is a queued prompt, however long the draft sits there.
+    hub.add(&agent.id, "queued behind it", None).await;
+    agent.stays(&want).await;
+    let waiting = hub.queue(&agent.id).await["waiting"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(waiting.contains("never sent"), "{waiting}");
+
+    // The line empties (its dim placeholder is not text): they go, one a
+    // turn.
+    std::fs::write(agent.path("sent"), "").unwrap();
+    want.extend(pasted("From the flywheel hub: the operator started it."));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("queued behind it"));
+    agent.typed_becomes(&want).await;
+}
+
+/// The other way round: the typed bytes say text sits unsent (its Enter
+/// was typed while the hub took the agent for blocked, so never counted)
+/// but the screen shows the input line empty. The screen wins: nothing
+/// waits forever on a draft that is not there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_line_the_screen_shows_empty_holds_nothing() {
+    let hub = TestHub::start().await;
+    std::fs::create_dir_all(hub.root.join("log")).unwrap();
+    std::fs::write(hub.root.join("log/draft"), "").unwrap();
+    let agent = hub.claude().await;
+    agent.fire("SessionStart", None).await;
+    status_is(&hub, &agent.id, "idle").await;
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(b"hey".to_vec().into()))
+        .await
+        .unwrap();
+    let mut want = b"hey".to_vec();
+    agent.typed_becomes(&want).await;
+    drop(term);
+    hub.add(&agent.id, "onto an empty line", None).await;
+    want.extend(pasted("onto an empty line"));
+    agent.typed_becomes(&want).await;
+    // The typed count was reset with it: the next one is not held either.
+    agent.turn().await;
+    hub.add(&agent.id, "and the next", None).await;
+    want.extend(pasted("and the next"));
+    agent.typed_becomes(&want).await;
+}
+
+/// A message typed straight into a resting agent that never starts a
+/// turn for it (the agent got the bytes and dropped them; its transcript
+/// never has it) is typed again once, then the queue stalls, shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_in_message_the_agent_never_takes_up_is_sent_again_then_stalls() {
+    let hub = TestHub::start_with(ACK).await;
+    let agent = hub.claude().await;
+    agent.turn().await;
+    status_is(&hub, &agent.id, "done").await;
+    sleep(QUIET + Duration::from_millis(500)).await;
+    let text = "From lead in flywheel: stop your waiting gate run.";
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    let sent = tokio::task::spawn_blocking(move || sender.send_or_queue(&id, text))
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = serde_json::to_value(&sent).unwrap();
+    assert_eq!(sent["delivery"], "pasted", "{sent}");
+    let mut want = pasted(text);
+    agent.typed_becomes(&want).await;
+    // No turn, and the transcript lacks it: after the ack timeout it is
+    // typed again.
+    want.extend(pasted(text));
+    let deadline = Instant::now() + ACK + WAIT;
+    while agent.typed() != want {
+        assert!(
+            Instant::now() < deadline,
+            "not sent again: typed {:?}",
+            String::from_utf8_lossy(&agent.typed())
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    // Lost again: the queue stalls, saying so; nothing is typed a third time.
+    let deadline = Instant::now() + ACK + WAIT;
+    loop {
+        let queue = hub.queue(&agent.id).await;
+        if let Some(reason) = queue["stalled"]["reason"].as_str() {
+            assert!(
+                reason.contains("did not start a turn") && reason.contains("sent twice"),
+                "{queue}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "never stalled: {queue}");
+        sleep(Duration::from_millis(100)).await;
+    }
+    agent.stays(&want).await;
+}
+
+/// The agent took the typed-in message up (its transcript has it) but no
+/// turn was reported: it is not typed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_in_message_the_transcript_has_is_never_sent_again() {
+    let hub = TestHub::start_with(ACK).await;
+    let agent = hub.claude().await;
+    agent.turn().await;
+    status_is(&hub, &agent.id, "done").await;
+    sleep(QUIET + Duration::from_millis(500)).await;
+    let text = "From lead in flywheel: read this once.";
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    tokio::task::spawn_blocking(move || sender.send_or_queue(&id, text))
+        .await
+        .unwrap()
+        .unwrap();
+    let want = pasted(text);
+    agent.typed_becomes(&want).await;
+    let line = json!({
+        "type": "user", "uuid": "u-1", "sessionId": "c",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message": {"role": "user", "content": text},
+    });
+    std::fs::write(&agent.transcript, format!("{line}\n")).unwrap();
+    sleep(ACK + Duration::from_millis(1500)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&agent.typed()),
+        String::from_utf8_lossy(&want),
+        "typed again though its transcript has it"
+    );
+}

@@ -89,6 +89,9 @@ pub struct AgentReplace {
     pub folder: Option<PathBuf>,
     pub worktree: Option<WorktreeRequest>,
     pub wait_minutes: Option<u32>,
+    /// The old session once it ended (`None`: remove one the caller
+    /// started, else keep).
+    pub session: Option<crate::close::SessionChoice>,
 }
 
 /// Whether `record` lives (or will, once the hub restores it).
@@ -618,7 +621,16 @@ impl Hub {
                 list.text()
             ));
         }
-        let close = self.close_choices(&target, end.close)?;
+        // A session the caller started is removed once it ended unless it
+        // says keep: nobody has to close what it retired.
+        let mut close = end.close;
+        if target.opened_by.as_deref() == Some(caller) {
+            let choices = close.get_or_insert_with(Default::default);
+            choices
+                .session
+                .get_or_insert(crate::close::SessionChoice::Remove);
+        }
+        let close = self.close_choices(&target, close)?;
         let final_prompt = trimmed(end.final_prompt.as_deref());
         match end.mode {
             EndMode::Force => return Err(refused(FORCE_REFUSED)),
@@ -700,6 +712,20 @@ impl Hub {
             None => None,
         };
         let wait = wait_of(replace.wait_minutes)?;
+        // The old session's record goes once it ended (by default when the
+        // caller started it): its successor carries the work on.
+        let removes = replace
+            .session
+            .unwrap_or(if target.opened_by.as_deref() == Some(caller) {
+                crate::close::SessionChoice::Remove
+            } else {
+                crate::close::SessionChoice::Keep
+            });
+        let close =
+            (removes == crate::close::SessionChoice::Remove).then(|| crate::close::CloseChoices {
+                session: Some(crate::close::SessionChoice::Remove),
+                ..Default::default()
+            });
         let policy = self.start_policy(&from);
         if policy == StartPolicy::Off {
             return Err(refused(format!(
@@ -740,7 +766,7 @@ impl Hub {
                     replace: Some(successor),
                     why,
                     created_at: Utc::now(),
-                    close: None,
+                    close: close.clone(),
                 },
                 owner.as_deref(),
             );
@@ -752,7 +778,7 @@ impl Hub {
             Some(&final_prompt),
             wait,
             Some(successor),
-            None,
+            close,
         )
     }
 

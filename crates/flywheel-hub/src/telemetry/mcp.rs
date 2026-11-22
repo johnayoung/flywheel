@@ -105,6 +105,9 @@ pub struct ReplaceArgs {
     /// A new worktree's task, and the branch to cut it from.
     pub worktree: Option<(String, Option<String>)>,
     pub wait_minutes: Option<u32>,
+    /// `keep` or `remove` the old session once it ended (`None`: remove
+    /// one the caller started, else keep).
+    pub session: Option<String>,
 }
 
 /// What the tools that act do, for the session calling them.
@@ -449,7 +452,8 @@ fn end_tool() -> Value {
                         allowed). close: what to do once it ended: worktree remove (only if \
                         clean and unshared; its branch is kept unless fully merged) or keep; \
                         build clean (deletes its target/ only) or keep; report: its final \
-                        status file, kept by the hub and shown after the worktree is gone. \
+                        status file, kept by the hub and shown after the worktree is gone; \
+                        session remove (the default for a session you started) or keep. \
                         Each is checked again at the end; one that no longer holds is \
                         refused and kept.",
         "inputSchema": {
@@ -478,7 +482,8 @@ fn end_tool() -> Value {
                     "properties": {
                         "worktree": { "type": "string", "enum": ["keep", "remove"] },
                         "build": { "type": "string", "enum": ["keep", "clean"] },
-                        "report": { "type": "string", "description": "Its final status file (relative to its directory, or absolute)." }
+                        "report": { "type": "string", "description": "Its final status file (relative to its directory, or absolute)." },
+                        "session": { "type": "string", "enum": ["keep", "remove"], "description": "The session itself once ended: remove takes it off the hub (its conversation stays resumable from its folder). Default: remove for a session you started, else keep." }
                     }
                 }
             },
@@ -528,6 +533,11 @@ fn replace_tool() -> Value {
                     "minimum": 1,
                     "maximum": 120,
                     "description": "Optional: how long the old one may take to come to rest. Default 20."
+                },
+                "session": {
+                    "type": "string",
+                    "enum": ["keep", "remove"],
+                    "description": "Optional: the old session once ended: remove takes it off the hub (its conversation stays resumable). Default: remove one you started, else keep."
                 }
             },
             "required": ["to", "name", "prompt", "final_prompt"]
@@ -1000,6 +1010,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         .get("wait_minutes")
                         .and_then(Value::as_u64)
                         .map(|m| u32::try_from(m).unwrap_or(u32::MAX)),
+                    session: given(Some(args), "session"),
                 };
                 Ok(
                     if replace.name.trim().is_empty()

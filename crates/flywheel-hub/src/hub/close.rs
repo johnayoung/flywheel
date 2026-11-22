@@ -123,7 +123,21 @@ impl Hub {
         let spawned = std::thread::Builder::new()
             .name("hub-close".into())
             .spawn(move || {
-                let done = hub.apply_close(&record, &choices, &end_id);
+                let mut said = Vec::new();
+                if !choices.removes_only() {
+                    let done = hub.apply_close(&record, &choices, &end_id);
+                    said.push(close_words(&done));
+                }
+                if choices.session == Some(crate::close::SessionChoice::Remove) {
+                    said.push(match hub.remove_session(&record.id) {
+                        Ok(()) => format!(
+                            "removed it from the hub (its conversation stays resumable from {}; \
+                             its history stays in telemetry)",
+                            record.cwd.display()
+                        ),
+                        Err(e) => format!("kept it on the hub (not removed: {e})"),
+                    });
+                }
                 if let Some(by) = by {
                     hub.tell(
                         &by,
@@ -131,7 +145,7 @@ impl Hub {
                             "From the flywheel hub: closed {} (id {}): {}",
                             record.name,
                             record.id,
-                            close_words(&done)
+                            said.join("; ")
                         ),
                     );
                 }

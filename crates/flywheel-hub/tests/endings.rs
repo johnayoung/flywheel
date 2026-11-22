@@ -475,7 +475,7 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     let said = lead
         .ok(
             "end_session",
-            json!({"to": "idle", "final_prompt": "Commit and stop."}),
+            json!({"to": "idle", "final_prompt": "Commit and stop.", "close": {"session": "keep"}}),
         )
         .await;
     assert!(said.starts_with("Ending idle (id "), "{said}");
@@ -549,7 +549,8 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     let said = lead
         .ok(
             "end_session",
-            json!({"to": "busy", "final_prompt": "Wind down.", "wait_minutes": 30}),
+            json!({"to": "busy", "final_prompt": "Wind down.", "wait_minutes": 30,
+                   "close": {"session": "keep"}}),
         )
         .await;
     assert!(said.contains("Set aside 2 messages"), "{said}");
@@ -1612,7 +1613,8 @@ async fn an_end_closes_its_worktree_only_when_nothing_is_lost() {
     lead.ok(
         "end_session",
         json!({"to": "worker", "mode": "at_rest",
-               "close": {"worktree": "remove", "build": "clean", "report": "STATUS.md"}}),
+               "close": {"worktree": "remove", "build": "clean", "report": "STATUS.md",
+                         "session": "keep"}}),
     )
     .await;
     hub.ended(&worker.id).await;
@@ -1921,6 +1923,52 @@ async fn the_operator_puts_a_session_under_a_lead_and_back() {
     assert_eq!(status, StatusCode::OK, "{view}");
     assert!(view["parent"].is_null(), "{view}");
     assert!(view["labels"]["fw.parent"].is_null(), "{view}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_its_starter_ends_or_replaces_leaves_the_hub() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let done = hub.claude("done", Some(&lead), json!({})).await;
+    let old = hub.claude("old", Some(&lead), json!({})).await;
+    for agent in [&lead, &done, &old] {
+        agent.turn().await;
+    }
+    let gone = |id: String| {
+        let hub = &hub;
+        async move {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                let (status, _) = hub
+                    .call(reqwest::Method::GET, &format!("/api/sessions/{id}"), None)
+                    .await;
+                if status == StatusCode::NOT_FOUND {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{id} stayed on the hub");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    // Ended by its starter: off the hub once it ended, the starter told.
+    lead.ok("end_session", json!({"to": "done", "mode": "at_rest"}))
+        .await;
+    gone(done.id.clone()).await;
+    hub.told(&lead, "removed it from the hub").await;
+    let kinds = hub.kinds(&done.id).await;
+    assert!(kinds.iter().any(|k| k == "session.ended"), "{kinds:?}");
+    // Replaced: the old one leaves, its successor carries on.
+    lead.ok(
+        "replace_session",
+        json!({"to": "old", "name": "new", "prompt": "Goal: go on.", "final_prompt": "Stop."}),
+    )
+    .await;
+    old.typed_has("Stop.").await;
+    old.turn().await;
+    gone(old.id.clone()).await;
+    let new = hub.named("new").await.expect("the successor runs");
+    assert_eq!(new["continues"], old.id.as_str());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2300,7 +2348,8 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
         .ok(
             "replace_session",
             json!({"to": "old", "name": "new", "prompt": "Goal: carry on from old.",
-                   "final_prompt": "Commit and write a summary.", "model": "sonnet"}),
+                   "final_prompt": "Commit and write a summary.", "model": "sonnet",
+                   "session": "keep"}),
         )
         .await;
     assert!(said.starts_with("Replacing old (id "), "{said}");
@@ -2352,7 +2401,7 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
         .ok(
             "replace_session",
             json!({"to": "new", "name": "newer", "prompt": "Goal: more.",
-                   "final_prompt": "Stop."}),
+                   "final_prompt": "Stop.", "session": "keep"}),
         )
         .await;
     assert!(

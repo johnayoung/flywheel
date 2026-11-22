@@ -48,6 +48,19 @@ pub enum BuildChoice {
     Clean,
 }
 
+/// What to do with the session itself once it ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionChoice {
+    /// It stays on the hub, exited, its scrollback attachable.
+    #[default]
+    Keep,
+    /// Removed from the hub (as the operator's close does): its
+    /// conversation stays on disk, resumable from its folder, and its
+    /// history in telemetry.
+    Remove,
+}
+
 /// The choices an end carries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseChoices {
@@ -58,10 +71,22 @@ pub struct CloseChoices {
     /// The final status file (absolute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<PathBuf>,
+    /// The session itself (`None`: unsaid; an agent's end of a session it
+    /// started defaults to remove).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionChoice>,
 }
 
 impl CloseChoices {
     pub fn is_empty(&self) -> bool {
+        self.worktree == WorktreeChoice::Keep
+            && self.build == BuildChoice::Keep
+            && self.report.is_none()
+            && self.session != Some(SessionChoice::Remove)
+    }
+
+    /// Only the session's removal: nothing to do in its directory.
+    pub fn removes_only(&self) -> bool {
         self.worktree == WorktreeChoice::Keep
             && self.build == BuildChoice::Keep
             && self.report.is_none()
@@ -491,6 +516,7 @@ mod tests {
             worktree: WorktreeChoice::Remove,
             build: BuildChoice::Clean,
             report: None,
+            session: None,
         }
     }
 
@@ -620,6 +646,7 @@ mod tests {
             worktree: WorktreeChoice::Remove,
             build: BuildChoice::Keep,
             report: Some(w.path.join("STATUS.md")),
+            session: None,
         };
         let roots = vec![w.path.clone()];
         let state = dir.path().join("state");

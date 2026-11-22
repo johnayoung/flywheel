@@ -294,6 +294,12 @@ impl mcp::Host for AgentHost {
                     base: base.clone(),
                 }),
             wait_minutes: args.wait_minutes,
+            session: match args.session.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some("keep") => Some(crate::close::SessionChoice::Keep),
+                Some("remove") => Some(crate::close::SessionChoice::Remove),
+                Some(other) => return Err(format!("session {other:?}: keep or remove")),
+            },
         };
         self.hub
             .agent_replace(&self.session, replace)

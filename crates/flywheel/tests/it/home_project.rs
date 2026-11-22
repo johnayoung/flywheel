@@ -12,8 +12,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

@@ -21,8 +21,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -559,7 +558,7 @@ fn a_pause_seeded_in_a_v10_store_holds_every_worker_after_the_upgrade() {
     {
         let raw = rusqlite::Connection::open(env.db_path()).unwrap();
         raw.execute_batch(include_str!(
-            "../../flywheel-orchestrator/tests/fixtures/orchestrator-schema-v10.sql"
+            "../../../flywheel-orchestrator/tests/fixtures/orchestrator-schema-v10.sql"
         ))
         .unwrap();
         raw.execute(

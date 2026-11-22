@@ -8,7 +8,7 @@
 
 #![cfg(unix)]
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 

@@ -14,8 +14,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use chrono::Utc;
 use flywheel::hub_flywheel::{AUTOPILOT_ACTIVITY, HubFlywheel};

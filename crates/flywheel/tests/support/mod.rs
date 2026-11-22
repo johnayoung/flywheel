@@ -11,8 +11,7 @@
 
 #![allow(dead_code)]
 
-#[path = "../../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

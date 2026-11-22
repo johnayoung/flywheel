@@ -48,7 +48,7 @@ scope_tests() {
   if [[ -z "$changed" ]]; then scope_note="all tests (no changes since origin/main)"; return; fi
   while IFS= read -r f; do
     case "$f" in
-      crates/flywheel/src/self_update/* | crates/flywheel/tests/self_update* | crates/flywheel/tests/support/*)
+      crates/flywheel/src/self_update/* | crates/flywheel/tests/it/self_update* | crates/flywheel/tests/support/*)
         self_update=1 ;;&
       crates/*/*) c=${f#crates/}; c=${c%%/*} ;;
       docs/*) c=flywheel-hub ;;
@@ -67,7 +67,7 @@ scope_tests() {
   if ((self_update)); then
     scope_note+=", self-update included"
   else
-    test_filter+=" and not (package(flywheel) and binary(/^self_update/))"
+    test_filter+=" and not (package(flywheel) and kind(test) and test(/^self_update_/))"
     scope_note+=", self-update skipped"
   fi
 }

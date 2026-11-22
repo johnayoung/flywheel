@@ -13,7 +13,7 @@
 
 #![cfg(target_os = "linux")]
 
-mod support;
+use crate::support;
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};

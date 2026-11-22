@@ -10,8 +10,7 @@
 #![cfg(unix)]
 
 // Stand-in scripts are written the flake-free way (see the helper).
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flywheel::hub_flywheel::{AUTOPILOT_ACTIVITY, HubFlywheel};

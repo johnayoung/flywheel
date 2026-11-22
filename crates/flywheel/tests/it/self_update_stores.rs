@@ -7,10 +7,9 @@
 //! under test, and no test signals a process (none is spawned to drain).
 //! Target versions come from the crates' constants, never literals.
 
-mod support;
+use crate::support;
 
-#[path = "../../flywheel-core/tests/support/pg_container.rs"]
-mod pg_container;
+use crate::pg_container;
 
 use flywheel_core::store::CURRENT_SCHEMA_VERSION;
 use flywheel_orchestrator::claims::CURRENT_ORCH_SCHEMA_VERSION;
@@ -426,12 +425,12 @@ fn a_behind_postgres_store_needs_the_flag_and_is_then_upgraded_without_a_backup(
         .unwrap();
     admin
         .batch_execute(include_str!(
-            "../../flywheel-core/tests/fixtures/persistence-schema-postgres-v14.sql"
+            "../../../flywheel-core/tests/fixtures/persistence-schema-postgres-v14.sql"
         ))
         .unwrap();
     admin
         .batch_execute(include_str!(
-            "../../flywheel-orchestrator/tests/fixtures/orchestrator-schema-postgres-v9.sql"
+            "../../../flywheel-orchestrator/tests/fixtures/orchestrator-schema-postgres-v9.sql"
         ))
         .unwrap();
     admin

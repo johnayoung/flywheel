@@ -195,7 +195,7 @@ fn a_v12_store_upgrades_with_its_rows_assigned_the_project_id() {
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(include_str!(
-            "../../flywheel-core/tests/fixtures/persistence-schema-v12.sql"
+            "../../../flywheel-core/tests/fixtures/persistence-schema-v12.sql"
         ))
         .unwrap();
         conn.execute_batch(
@@ -242,7 +242,7 @@ fn an_explicit_db_upgrade_binds_the_default_partition() {
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(include_str!(
-            "../../flywheel-core/tests/fixtures/persistence-schema-v12.sql"
+            "../../../flywheel-core/tests/fixtures/persistence-schema-v12.sql"
         ))
         .unwrap();
         conn.execute_batch(

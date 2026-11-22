@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::time::{Duration, Instant};

@@ -14,8 +14,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use serde_json::Value;
 use std::collections::BTreeMap;

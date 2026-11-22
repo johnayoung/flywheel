@@ -7,7 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
-mod support;
+use crate::support;
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};

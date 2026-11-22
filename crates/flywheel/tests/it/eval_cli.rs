@@ -3,7 +3,7 @@
 //! home, against a store seeded with a landed run whose held-out oracle
 //! discriminates its base from its landed commit.
 
-mod support;
+use crate::support;
 
 use chrono::{Duration, TimeZone, Utc};
 use flywheel_core::events::{DomainEvent, DomainEventPayload, Landed};

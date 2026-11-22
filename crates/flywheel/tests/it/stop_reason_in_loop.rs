@@ -10,8 +10,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../flywheel-hub/tests/support/script.rs"]
-mod script;
+use crate::script;
 
 use flywheel_core::lifecycle::{Lifecycle, Outcome, Status, StopReason};
 use flywheel_core::store::{CURRENT_SCHEMA_VERSION, LifecycleFilter, LifecycleStore};
@@ -140,7 +139,7 @@ impl Env {
     fn seed_v14(&self) {
         let raw = rusqlite::Connection::open(self.db_path()).unwrap();
         raw.execute_batch(include_str!(
-            "../../flywheel-core/tests/fixtures/persistence-schema-v14.sql"
+            "../../../flywheel-core/tests/fixtures/persistence-schema-v14.sql"
         ))
         .unwrap();
         let seed = "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)

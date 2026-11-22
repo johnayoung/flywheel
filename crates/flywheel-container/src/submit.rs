@@ -28,6 +28,7 @@ use crate::docker::{
     DockerError, RunSpec, VolumeMount, default_management_timeout,
 };
 use crate::gitdir::git_metadata_mounts;
+use crate::jobserver::Jobserver;
 use crate::network::{DEFAULT_INTERNAL_NETWORK, resolve_network};
 use flywheel_agents::hosts::{DockerExecHost, ExecutionHost};
 use flywheel_orchestrator::strategy::{
@@ -195,6 +196,9 @@ pub struct ContainerSubmitStrategy {
     registry: Arc<CleanupRegistry>,
     invoke_builder: HostInvokeBuilder,
     log: ContainerLog,
+    /// The build jobserver the worker's environment carries (a budgeted
+    /// hub session's): its FIFO mounted, its variables in every exec.
+    jobserver: Option<Jobserver>,
 }
 
 impl fmt::Debug for ContainerSubmitStrategy {
@@ -262,7 +266,15 @@ impl ContainerSubmitStrategy {
             registry: CleanupRegistry::global(),
             invoke_builder,
             log: Arc::new(|line| eprintln!("{line}")),
+            jobserver: Jobserver::from_env(),
         })
+    }
+
+    /// Share `jobserver` with the containers instead of the one the
+    /// environment carries (`None`: share none).
+    pub fn with_jobserver(mut self, jobserver: Option<Jobserver>) -> Self {
+        self.jobserver = jobserver;
+        self
     }
 
     /// Use `docker` for every management call and as the `docker` argv
@@ -354,6 +366,10 @@ impl ContainerSubmitStrategy {
                 .map_err(|err| PrepareError::with_source(err.to_string(), err))?,
         );
         mounts.extend(self.mounts.iter().cloned());
+        if let Some(jobserver) = &self.jobserver {
+            let fifo = jobserver.fifo.to_string_lossy().into_owned();
+            mounts.push(VolumeMount::new(fifo.clone(), fifo));
+        }
         let spec = RunSpec {
             name: name.clone(),
             image: self.image.clone(),
@@ -387,12 +403,21 @@ impl ContainerSubmitStrategy {
         Ok(name)
     }
 
+    /// The host the agent runs through: `docker exec` into `container_name`,
+    /// with the shared jobserver's variables when there is one.
+    pub fn exec_host(&self, container_name: &str) -> DockerExecHost {
+        let host =
+            DockerExecHost::new(container_name).with_docker_argv(self.docker.program().to_vec());
+        match &self.jobserver {
+            Some(jobserver) => host.with_env(jobserver.env.clone()),
+            None => host,
+        }
+    }
+
     fn make_invoke_wrapper(&self, container_name: &str) -> InvokeWrapper {
         let builder = Arc::clone(&self.invoke_builder);
         let spec = self.invoke_spec();
-        let host: Arc<dyn ExecutionHost> = Arc::new(
-            DockerExecHost::new(container_name).with_docker_argv(self.docker.program().to_vec()),
-        );
+        let host: Arc<dyn ExecutionHost> = Arc::new(self.exec_host(container_name));
         // The host SDK invoker is replaced wholesale: the agent runs in the
         // container, not the worker process. The base invoke (`None` in
         // normal operation) is intentionally ignored.
@@ -586,8 +611,10 @@ mod tests {
         let registry = Arc::new(CleanupRegistry::new());
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&lines);
+        // Hermetic: a worker run in a budgeted hub session carries one.
         let strategy = ContainerSubmitStrategy::new(inner, config, builder)
             .unwrap()
+            .with_jobserver(None)
             .with_docker(docker)
             .with_registry(Arc::clone(&registry))
             .with_log(Arc::new(move |line| {
@@ -925,6 +952,45 @@ mod tests {
                 permission_policy: "auto".into(),
                 timeout_seconds: Some(900.0),
             }
+        );
+    }
+
+    #[test]
+    fn a_shared_jobserver_is_mounted_and_passed_into_every_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        let flags = "-j8 --jobserver-auth=fifo:/state/build-jobserver.fifo";
+        let jobserver = Jobserver::from_vars(|key| (key == "MAKEFLAGS").then(|| flags.to_owned()));
+        let h = harness(dir.path(), inner, config(), HAPPY_BODY);
+        let plan = flywheel_agents::ProcessPlan::new(vec!["claude".into()]);
+        // Without one: the exec argv is the one without the feature.
+        let today = DockerExecHost::new("box")
+            .with_docker_argv(h.strategy.docker.program().to_vec())
+            .assemble_argv(&plan, "f");
+        let without = h.strategy.exec_host("box");
+        assert_eq!(without.assemble_argv(&plan, "f"), today);
+        h.strategy.prepare_sandbox(&request("plain")).unwrap();
+        assert!(
+            !flag_values(&run_call(&h.log), "-v")
+                .iter()
+                .any(|m| m.contains("jobserver")),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        let mut h = harness(dir.path(), inner, config(), HAPPY_BODY);
+        h.strategy = h.strategy.with_jobserver(jobserver);
+        h.strategy.prepare_sandbox(&request("shared")).unwrap();
+        assert!(
+            flag_values(&run_call(&h.log), "-v")
+                .contains(&"/state/build-jobserver.fifo:/state/build-jobserver.fifo"),
+            "the FIFO is mounted at its own path"
+        );
+        let argv = h.strategy.exec_host("box").assemble_argv(&plan, "f");
+        let at = argv.iter().position(|a| a == "exec").unwrap();
+        assert_eq!(
+            argv[at + 1..at + 3],
+            ["-e".to_owned(), format!("MAKEFLAGS={flags}")]
         );
     }
 

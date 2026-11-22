@@ -17,6 +17,7 @@ pub mod auth;
 pub mod config;
 pub mod docker;
 pub mod gitdir;
+pub mod jobserver;
 pub mod network;
 pub mod submit;
 
@@ -34,6 +35,7 @@ pub use docker::{
     spawn_container_orphan_reap,
 };
 pub use gitdir::{GitDirError, git_metadata_mounts};
+pub use jobserver::Jobserver;
 pub use network::{DEFAULT_INTERNAL_NETWORK, NetworkError, ResolvedNetwork, resolve_network};
 pub use submit::{
     ContainerConfig, ContainerInvokeSpec, ContainerLog, ContainerSubmitStrategy, HostInvokeBuilder,

@@ -81,6 +81,10 @@ The agent commits its own work in the container (an uncommitted tree parks as `u
 
 **Security:** the agent can read and rewrite any ref and object of the repository (other branches, `main`) -- the same reach it has on the worktree backend, where the agent runs as the host user. It cannot change the shared repo config or hooks. Residual: the worktree's own `.git` file is agent-writable (as before this mount), so it can redirect git commands run *in that worktree*. A plain directory or a `.git` directory sandbox gets no extra mounts.
 
+## Shared build jobserver
+
+A worker whose environment carries a FIFO jobserver (`MAKEFLAGS` / `CARGO_MAKEFLAGS` with `--jobserver-auth=fifo:PATH`, as every `fw hub` session gets from its build budget) bind-mounts the FIFO at the same path (rw) and passes those variables into every `docker exec` (`crates/flywheel-container/src/jobserver.rs`), so container builds draw from the host's pool. Without one, the run and exec argv are unchanged.
+
 ## Container lifecycle and orphan reap
 
 Containers are started without `--rm` so a dead sandbox stays inspectable (`docker logs`, exit code) until teardown (`stop` + `rm`; a `stop` that exceeds the management ceiling falls through to `rm -f`) or the exit-time registry removes it. A container whose teardown removal failed stays registered, so the exit-time flush retries it. Each container carries owner labels: host, pid, and (Linux) process start time and pid namespace. At worker boot, `reap_container_orphans` (on a background thread alongside the first cycle, joined before the worker exits) removes only flywheel containers whose owner is provably dead **on this host and in this pid namespace** (pid gone, or pid reused by another process); live owners, other hosts', and other namespaces' containers (sibling WSL2 distros, containerised workers) are never touched. Containers without owner labels (pre-0.6.0) are treated as orphans.

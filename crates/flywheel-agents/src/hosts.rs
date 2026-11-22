@@ -504,6 +504,9 @@ impl ExecutionHost for LocalHost {
 pub struct DockerExecHost {
     pub container_name: String,
     pub docker_argv: Vec<String>,
+    /// Variables every exec passes in (`-e`) ahead of the plan's own, which
+    /// win on a clash (a build jobserver the container shares).
+    pub env: Vec<(String, String)>,
 }
 
 /// In-container directory holding the per-run process-group files.
@@ -587,7 +590,14 @@ impl DockerExecHost {
         Self {
             container_name: container_name.into(),
             docker_argv: vec!["docker".to_string()],
+            env: Vec::new(),
         }
+    }
+
+    /// Pass `env` into every exec (before the plan's own variables).
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn with_docker_argv(mut self, docker_argv: Vec<String>) -> Self {
@@ -608,7 +618,12 @@ impl DockerExecHost {
         if plan.stdin != StdinPlan::Closed {
             argv.push("-i".to_string());
         }
-        for (key, value) in &plan.environment {
+        for (key, value) in self
+            .env
+            .iter()
+            .map(|(k, v)| (k, v))
+            .chain(&plan.environment)
+        {
             argv.push("-e".to_string());
             argv.push(format!("{key}={value}"));
         }
@@ -819,6 +834,34 @@ mod tests {
                 "--print"
             ]
         );
+    }
+
+    #[test]
+    fn docker_argv_passes_host_env_before_the_plans() {
+        let mut plan = ProcessPlan::new(vec!["cargo".into()]);
+        plan.environment.insert("K".into(), "V".into());
+        let bare = DockerExecHost::new("c").with_docker_argv(vec!["docker".into()]);
+        let shared = bare.clone().with_env(vec![(
+            "MAKEFLAGS".into(),
+            "-j4 --jobserver-auth=fifo:/p".into(),
+        )]);
+        let argv = shared.assemble_argv(&plan, "f");
+        assert_eq!(
+            argv[..7],
+            [
+                "docker",
+                "exec",
+                "-e",
+                "MAKEFLAGS=-j4 --jobserver-auth=fifo:/p",
+                "-e",
+                "K=V",
+                "c"
+            ]
+        );
+        // None set: the argv is the one without the feature.
+        let without = bare.assemble_argv(&plan, "f");
+        assert_eq!(without[..5], ["docker", "exec", "-e", "K=V", "c"]);
+        assert_eq!(bare.with_env(Vec::new()).assemble_argv(&plan, "f"), without);
     }
 
     #[test]

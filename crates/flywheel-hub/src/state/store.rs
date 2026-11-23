@@ -1140,13 +1140,14 @@ impl HubStore {
         Ok(removed)
     }
 
-    /// Give watch `id` a new `prompt` and `window_secs`, keeping its
-    /// cursor and anything it has gathered.
+    /// Give watch `id` a new `prompt` and `window_secs` (and `pace_secs`,
+    /// when given), keeping its cursor and anything it has gathered.
     pub fn rearm_watch(
         &mut self,
         id: &str,
         prompt: &str,
         window_secs: u32,
+        pace_secs: Option<u32>,
     ) -> Result<crate::watch::Watch, StateError> {
         let at = self
             .doc
@@ -1157,6 +1158,9 @@ impl HubStore {
         let previous = self.doc.watches[at].clone();
         self.doc.watches[at].prompt = prompt.to_owned();
         self.doc.watches[at].window_secs = window_secs;
+        if pace_secs.is_some() {
+            self.doc.watches[at].pace_secs = pace_secs;
+        }
         let rearmed = self.doc.watches[at].clone();
         self.save_or_rollback(move |doc| doc.watches[at] = previous)?;
         Ok(rearmed)

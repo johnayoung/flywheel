@@ -48,6 +48,11 @@ struct AddArgs {
     /// Gather matches this many seconds before queueing them (default 3).
     #[arg(long, value_name = "SECS")]
     window: Option<u32>,
+    /// Hold matches that only say a session finished this many seconds
+    /// before queueing them (default 300 for `children`, else 0); one that
+    /// asks, blocks, or fails queues at once.
+    #[arg(long, value_name = "SECS")]
+    pace: Option<u32>,
     /// Match events after this cursor (default: from now).
     #[arg(long, value_name = "CURSOR")]
     after: Option<String>,
@@ -106,6 +111,9 @@ fn run(args: &WatchArgs, out: &mut dyn Write) -> Result<(), String> {
                                    "at": add.at, "every": add.every });
             if let Some(window) = add.window {
                 body["window_secs"] = json!(window);
+            }
+            if let Some(pace) = add.pace {
+                body["pace_secs"] = json!(pace);
             }
             if let Some(after) = &add.after {
                 body["after"] = json!(after);

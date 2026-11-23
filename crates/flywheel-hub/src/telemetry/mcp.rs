@@ -165,6 +165,7 @@ pub trait Host {
         filter: &str,
         prompt: &str,
         window_secs: Option<u32>,
+        pace_secs: Option<u32>,
         at: Option<&str>,
         every: Option<&str>,
     ) -> Result<String, String>;
@@ -639,7 +640,10 @@ fn watch_tool() -> Value {
                         state=done|blocked|failed|asking (a session moving there), \
                         kind=review|pr|queue|lease (event kinds or families; children \
                         kind=lease catches a stuck lease they wait on), or labels (team=web). \
-                        Example: \"children state=done|blocked|failed\". Your own events never \
+                        Example: \"children state=done|blocked|failed\". A children watch \
+                        holds sessions that only finished a turn up to pace_secs (default \
+                        300) so several arrive at once; one that asks, blocks, or fails \
+                        wakes you at once, the held ones with it. Your own events never \
                         match. By time instead of filter: at (\"2026-11-23T12:00Z\" or \
                         \"+36h\") wakes you once; every (\"6h\", at least 5m) wakes you \
                         repeatedly; a time watch survives hub restarts and passes to your \
@@ -658,6 +662,12 @@ fn watch_tool() -> Value {
                     "minimum": 0,
                     "maximum": 3600,
                     "description": "Optional: gather matches this long before waking you. Default 3."
+                },
+                "pace_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3600,
+                    "description": "Optional: hold matches that only say a session finished this long before waking you. Default 300 for children, else 0; 0 wakes on every one."
                 }
             },
             "required": ["prompt"]
@@ -1051,16 +1061,18 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     },
                 })
             } else if name == Some(WATCH_TOOL) {
-                let window = args
-                    .get("window_secs")
-                    .and_then(Value::as_u64)
-                    .map(|w| u32::try_from(w).unwrap_or(u32::MAX));
+                let secs = |key: &str| {
+                    args.get(key)
+                        .and_then(Value::as_u64)
+                        .map(|w| u32::try_from(w).unwrap_or(u32::MAX))
+                };
                 let given = |key: &str| Some(arg(key).trim()).filter(|v| !v.is_empty());
                 Ok(
                     match host.watch(
                         arg("filter"),
                         arg("prompt"),
-                        window,
+                        secs("window_secs"),
+                        secs("pace_secs"),
                         given("at"),
                         given("every"),
                     ) {
@@ -1317,10 +1329,13 @@ mod tests {
             filter: &str,
             prompt: &str,
             window_secs: Option<u32>,
+            pace_secs: Option<u32>,
             _at: Option<&str>,
             _every: Option<&str>,
         ) -> Result<String, String> {
-            Ok(format!("{filter} / {prompt} / {window_secs:?}"))
+            Ok(format!(
+                "{filter} / {prompt} / {window_secs:?} / {pace_secs:?}"
+            ))
         }
         fn unwatch(&self, id: &str) -> Result<String, String> {
             Ok(format!("unwatched {id}"))

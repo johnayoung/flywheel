@@ -1840,10 +1840,11 @@ async fn a_replaced_leads_successor_hears_its_children() {
         next.id.as_str(),
         "{watches}"
     );
-    // The child's report reaches it.
+    // The child's report reaches it (a question wakes at once; a plain
+    // finish waits out the watch's pace).
     kid.hook(
         "Stop",
-        json!({"last_assistant_message": "Outcome: done, branch kid at abc"}),
+        json!({"last_assistant_message": "Outcome: done, branch kid at abc. Merge it?"}),
     )
     .await;
     next.typed_has("Outcome: done, branch kid at abc").await;

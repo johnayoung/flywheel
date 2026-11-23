@@ -160,7 +160,7 @@ fw hub queue clear SESSION [--all] [--json] {where}
 fw hub queue move SESSION ITEM POS [--json] {where}
 fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
-fw hub watch add SESSION (--on FILTER | --at TIME | --every SPAN) --prompt TEXT|- [--window SECS] [--after CURSOR] [--json] {where}
+fw hub watch add SESSION (--on FILTER | --at TIME | --every SPAN) --prompt TEXT|- [--window SECS] [--pace SECS] [--after CURSOR] [--json] {where}
 fw hub watch ls [SESSION] [--json] {where}
 fw hub watch rm WATCH [--json] {where}  # a prompt it queued stays
 fw hub lease acquire RESOURCE [--shared] [--ttl SPAN] [--wait SPAN] [--note T] [--json] {where}

@@ -320,21 +320,39 @@ async fn a_lead_is_woken_once_for_children_finishing_together() {
     let watch = t
         .post(
             "/api/watches",
-            json!({ "owner": "lead", "filter": "children state=done",
-                    "prompt": "Children finished: review them.", "window_secs": 1 }),
+            json!({ "owner": "lead", "filter": "children state=done|asking",
+                    "prompt": "Children finished: review them.", "window_secs": 1,
+                    "pace_secs": 30 }),
         )
         .await;
     assert_eq!(watch["owner"], lead.id.as_str());
     assert_eq!(watch["filter"]["children"], lead.id.as_str());
-    // All three finish together: one prompt, three events.
-    for child in &children {
+    assert_eq!(watch["pace_secs"], 30);
+    // Two finish: held for the pace, nothing queued yet.
+    for child in &children[..2] {
         child.fire("UserPromptSubmit", None).await;
-    }
-    for child in &children {
         child.fire("Stop", None).await;
     }
+    sleep(Duration::from_secs(2)).await;
+    let queue = queue_of(&t, &lead.id).await;
+    assert!(
+        queue["items"].as_array().unwrap().is_empty(),
+        "finished turns wait for the pace: {queue}"
+    );
+    // The third asks: the lead is woken at once, the held two with it.
+    children[2].fire("UserPromptSubmit", None).await;
+    children[2]
+        .fire_with(
+            "Stop",
+            json!({ "last_assistant_message": "Built it. Should I merge c3 now?" }),
+        )
+        .await;
     let items = watch_items(&t, &lead.id, 3).await;
     assert_eq!(items.len(), 1, "coalesced into one prompt: {items:?}");
+    assert!(
+        items[0]["text"].as_str().unwrap().contains("-> asking"),
+        "{items:?}"
+    );
     let text = items[0]["text"].as_str().unwrap().to_owned();
     assert!(
         text.starts_with("Children finished: review them."),
@@ -396,7 +414,7 @@ async fn five_hundred_children_finishing_at_once_are_one_prompt() {
     t.post(
         "/api/watches",
         json!({ "owner": lead.id, "filter": "children state=done|failed",
-                "prompt": "Batch done.", "window_secs": 2 }),
+                "prompt": "Batch done.", "window_secs": 2, "pace_secs": 0 }),
     )
     .await;
     // Five hundred children the lead opened (their reports, as captured
@@ -498,7 +516,8 @@ async fn a_started_child_reports_by_its_closing_message_and_holds_its_lead() {
     // Arming the same filter again replaces its prompt: still one watch.
     t.post(
         "/api/watches",
-        json!({ "owner": lead.id, "filter": DEFAULT_CHILDREN_FILTER, "prompt": "Mine." }),
+        json!({ "owner": lead.id, "filter": DEFAULT_CHILDREN_FILTER, "prompt": "Mine.",
+                "pace_secs": 0 }),
     )
     .await;
     let listed = t.get(&format!("/api/watches?session={}", lead.id)).await;
@@ -506,6 +525,7 @@ async fn a_started_child_reports_by_its_closing_message_and_holds_its_lead() {
     assert_eq!(watches.len(), 1, "{listed}");
     assert_eq!(watches[0]["id"], armed);
     assert_eq!(watches[0]["prompt"], "Mine.");
+    assert_eq!(watches[0]["pace_secs"], 0, "re-arming sets its pace");
 
     // The lead's turn ends while its child works: it waits, not done.
     lead.fire_with(

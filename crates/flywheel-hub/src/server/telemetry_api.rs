@@ -340,11 +340,23 @@ impl mcp::Host for AgentHost {
         filter: &str,
         prompt: &str,
         window_secs: Option<u32>,
+        pace_secs: Option<u32>,
         at: Option<&str>,
         every: Option<&str>,
     ) -> Result<String, String> {
         self.hub
-            .agent_watch(&self.session, filter, prompt, window_secs, at, every)
+            .agent_watch(
+                &self.session,
+                crate::watch::NewWatch {
+                    filter: filter.to_owned(),
+                    prompt: prompt.to_owned(),
+                    window_secs,
+                    pace_secs,
+                    at: at.map(str::to_owned),
+                    every: every.map(str::to_owned),
+                    ..crate::watch::NewWatch::default()
+                },
+            )
             .map_err(|e| e.to_string())
     }
 

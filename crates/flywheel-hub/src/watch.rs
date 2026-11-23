@@ -39,6 +39,14 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_WINDOW_SECS: u32 = 3;
 /// The longest window.
 pub const MAX_WINDOW_SECS: u32 = 3600;
+/// How long a children watch holds its sessions' finished turns before
+/// waking its owner, unless it names a pace: a session that asks, blocks,
+/// or fails wakes it at once, the held ones with it. Measured on lead
+/// sessions: half their wakes were reports they did nothing with, and 5
+/// minutes of holding cut their wakes by two thirds.
+pub const DEFAULT_CHILDREN_PACE_SECS: u32 = 300;
+/// The states a paced watch holds; any other wakes its owner at once.
+const PACED_STATES: [&str; 3] = ["done", "idle", "background"];
 /// Watches per owner, and per hub.
 pub const MAX_PER_OWNER: usize = 20;
 pub const MAX_PER_HUB: usize = 2000;
@@ -106,6 +114,11 @@ pub struct Watch {
     pub prompt: String,
     #[serde(default = "default_window")]
     pub window_secs: u32,
+    /// How long it holds matches that only say a session finished (see
+    /// [`PACED_STATES`]) before waking its owner; `None`: the default
+    /// ([`Watch::pace`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pace_secs: Option<u32>,
     /// Every log row up to here was looked at and, matching, queued.
     pub cursor: i64,
     pub created_at: DateTime<Utc>,
@@ -233,6 +246,16 @@ pub fn parse_at(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> 
 }
 
 impl Watch {
+    /// How long it holds finished turns: its own pace, else
+    /// [`DEFAULT_CHILDREN_PACE_SECS`] for a children watch, else none.
+    pub fn pace(&self) -> u32 {
+        self.pace_secs.unwrap_or(if self.filter.children.is_some() {
+            DEFAULT_CHILDREN_PACE_SECS
+        } else {
+            0
+        })
+    }
+
     /// The short id people type (`w` and 7 hex).
     pub fn short(&self) -> String {
         format!("w{}", &self.id[..7.min(self.id.len())])
@@ -290,6 +313,9 @@ pub struct NewWatch {
     pub prompt: String,
     #[serde(default)]
     pub window_secs: Option<u32>,
+    /// Hold finished turns this long before waking (see [`Watch::pace`]).
+    #[serde(default)]
+    pub pace_secs: Option<u32>,
     /// Match from this cursor on (default: from now).
     #[serde(default)]
     pub after: Option<String>,
@@ -365,6 +391,29 @@ fn lines_within(rows: &[LogRow], budget: usize) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Whether `watch` wakes its owner with `rows`, gathered for `elapsed`:
+/// after its window, unless all of them only say a session finished, which
+/// it holds for its pace; a waiting prompt of its own takes them at once
+/// (it wakes nobody new).
+fn due(watch: &Watch, rows: &[LogRow], elapsed: Duration) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    let window = Duration::from_secs(u64::from(watch.window_secs));
+    let held = watch.batch.is_none()
+        && rows.iter().all(|row| {
+            row.state
+                .as_deref()
+                .is_some_and(|state| PACED_STATES.contains(&state))
+        });
+    let wait = if held {
+        window.max(Duration::from_secs(u64::from(watch.pace())))
+    } else {
+        window
+    };
+    elapsed >= wait
 }
 
 /// The engine's memory: how far each watch has looked, and its matches
@@ -450,6 +499,11 @@ impl Hub {
             ))
             .into());
         }
+        if new.pace_secs.is_some_and(|p| p > MAX_WINDOW_SECS) {
+            return Err(
+                StateError::Invalid(format!("pace is at most {MAX_WINDOW_SECS} seconds")).into(),
+            );
+        }
         // The same filter armed again by its owner: one watch, its prompt
         // and window replaced (two would wake it twice for every event).
         // A new watch on its children replaces the one the hub armed for
@@ -457,7 +511,9 @@ impl Hub {
         if time.is_none() {
             let mine = self.watches(Some(&owner.id));
             if let Some(same) = mine.iter().find(|w| w.time.is_none() && w.filter == filter) {
-                let watch = self.store().rearm_watch(&same.id, prompt, window_secs)?;
+                let watch =
+                    self.store()
+                        .rearm_watch(&same.id, prompt, window_secs, new.pace_secs)?;
                 self.queue_changed();
                 return Ok(watch);
             }
@@ -480,6 +536,7 @@ impl Hub {
             filter,
             prompt: prompt.to_owned(),
             window_secs,
+            pace_secs: new.pace_secs,
             cursor,
             created_at: Utc::now(),
             by: by.map(str::to_owned),
@@ -495,25 +552,14 @@ impl Hub {
         Ok(watch)
     }
 
-    /// The `watch` agent tool: arm a watch that wakes `caller`.
-    pub fn agent_watch(
-        &self,
-        caller: &str,
-        filter: &str,
-        prompt: &str,
-        window_secs: Option<u32>,
-        at: Option<&str>,
-        every: Option<&str>,
-    ) -> Result<String, HubError> {
+    /// The `watch` agent tool: arm `new` (its owner and cursor set here)
+    /// as a watch that wakes `caller`.
+    pub fn agent_watch(&self, caller: &str, new: NewWatch) -> Result<String, HubError> {
         let watch = self.watch_add(
             &NewWatch {
                 owner: caller.to_owned(),
-                filter: filter.to_owned(),
-                prompt: prompt.to_owned(),
-                window_secs,
                 after: None,
-                at: at.map(str::to_owned),
-                every: every.map(str::to_owned),
+                ..new
             },
             Some(caller),
         )?;
@@ -876,15 +922,14 @@ impl Hub {
     /// Queue what each watch gathered once its window passed; save quiet
     /// watches' cursors now and then. Whether anything still gathers.
     fn watch_deliver(&self, watches: &[Watch]) -> bool {
-        let due: Vec<(Watch, Vec<LogRow>, i64)> = {
+        let ripe: Vec<(Watch, Vec<LogRow>, i64)> = {
             let mut scan = self.engine();
-            let mut due = Vec::new();
+            let mut ripe = Vec::new();
             for watch in watches {
-                let window = Duration::from_secs(u64::from(watch.window_secs));
                 let ready = scan
                     .gathered
                     .get(&watch.id)
-                    .is_some_and(|(rows, first)| !rows.is_empty() && first.elapsed() >= window);
+                    .is_some_and(|(rows, first)| due(watch, rows, first.elapsed()));
                 if ready {
                     let rows = scan
                         .gathered
@@ -892,12 +937,12 @@ impl Hub {
                         .map(|(rows, _)| rows)
                         .unwrap_or_default();
                     let looked = scan.looked.get(&watch.id).copied().unwrap_or(watch.cursor);
-                    due.push((watch.clone(), rows, looked));
+                    ripe.push((watch.clone(), rows, looked));
                 }
             }
-            due
+            ripe
         };
-        for (watch, rows, looked) in due {
+        for (watch, rows, looked) in ripe {
             if let Err(e) = self.watch_queue(&watch, &rows, looked) {
                 // Not queued (the owner is ending, its queue is full): the
                 // matches stay gathered and are tried again.
@@ -1170,6 +1215,7 @@ mod time_tests {
             owner: "o".into(),
             filter: Filter::default(),
             prompt: "check".into(),
+            pace_secs: None,
             window_secs: 3,
             cursor: 0,
             created_at: at(0),
@@ -1198,5 +1244,100 @@ mod time_tests {
             ),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pace_tests {
+    use super::*;
+
+    fn watch(children: bool, pace_secs: Option<u32>) -> Watch {
+        let filter = if children {
+            Filter::parse("children state=done|blocked|failed|asking").unwrap()
+        } else {
+            Filter::parse("session=w1 state=done").unwrap()
+        };
+        let mut filter = filter;
+        if children {
+            filter.children = Some("lead".into());
+        }
+        Watch {
+            id: "abcdef0123".into(),
+            owner: "lead".into(),
+            filter,
+            prompt: "act on it".into(),
+            window_secs: 3,
+            pace_secs,
+            cursor: 0,
+            created_at: Utc::now(),
+            by: None,
+            fired: 0,
+            last_fired: None,
+            events: 0,
+            batch: None,
+            time: None,
+        }
+    }
+
+    fn moved(state: &str) -> LogRow {
+        LogRow {
+            cursor: String::new(),
+            at: 1,
+            host: "h".into(),
+            session: "w1".into(),
+            seq: 1,
+            ts: 0,
+            kind: "turn.finished".into(),
+            state: Some(state.into()),
+            agent: None,
+            body: serde_json::json!({}),
+            name: Some("w1".into()),
+            workspace: None,
+        }
+    }
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn a_children_watch_holds_finished_turns_for_its_pace() {
+        let lead = watch(true, None);
+        assert_eq!(lead.pace(), DEFAULT_CHILDREN_PACE_SECS);
+        let done = [moved("done"), moved("done")];
+        assert!(!due(&lead, &done, 10 * SEC), "a report waits for others");
+        assert!(due(&lead, &done, 300 * SEC), "but never past its pace");
+        assert!(!due(&lead, &[], 400 * SEC), "nothing gathered wakes nobody");
+    }
+
+    #[test]
+    fn asking_blocked_or_failed_wakes_at_once_with_the_held_ones() {
+        let lead = watch(true, None);
+        for urgent in ["asking", "blocked", "failed", "ended"] {
+            let rows = [moved("done"), moved(urgent)];
+            assert!(!due(&lead, &rows, SEC), "{urgent}: within the window");
+            assert!(due(&lead, &rows, 3 * SEC), "{urgent}: after the window");
+        }
+    }
+
+    #[test]
+    fn a_waiting_prompt_takes_finished_turns_at_once() {
+        let mut lead = watch(true, None);
+        lead.batch = Some(Batch {
+            item: "i".into(),
+            lines: vec!["earlier".into()],
+            more: 0,
+            from: String::new(),
+            to: String::new(),
+        });
+        assert!(due(&lead, &[moved("done")], 3 * SEC));
+    }
+
+    #[test]
+    fn pace_zero_and_other_watches_wake_after_the_window() {
+        assert!(due(&watch(true, Some(0)), &[moved("done")], 3 * SEC));
+        let one = watch(false, None);
+        assert_eq!(one.pace(), 0);
+        assert!(due(&one, &[moved("done")], 3 * SEC));
+        assert!(due(&watch(false, Some(60)), &[moved("done")], 60 * SEC));
+        assert!(!due(&watch(false, Some(60)), &[moved("done")], 59 * SEC));
     }
 }

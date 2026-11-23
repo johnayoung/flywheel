@@ -325,7 +325,14 @@ pub enum What {
     },
     /// A prompt was submitted: the agent starts working on it.
     #[serde(rename = "turn.started")]
-    TurnStarted { title: String },
+    TurnStarted {
+        title: String,
+        /// The prompt was relayed, not the operator's answer: a worker's
+        /// message, a watch, a hub notice, a background task's result. It
+        /// answers nothing the session asked.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relayed: bool,
+    },
     #[serde(rename = "turn.finished")]
     TurnFinished {
         /// The end of the turn's closing message, scrubbed and capped

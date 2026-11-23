@@ -387,11 +387,34 @@ fn migrate(conn: &Connection, _from: i64) -> rusqlite::Result<()> {
     )
 }
 
-/// Who answered, from a prompt: an agent's message (the hub's signed
-/// sender line, `From <name> ...: a message from that agent session`) is
-/// `agent:<name>`; anything else is the operator's.
-pub fn by_of_prompt(prompt: &str, known: impl Fn(&str) -> bool) -> String {
-    let first = prompt.lines().next().unwrap_or("");
+/// Who sent a prompt a session received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    /// The operator (typed, pasted, or sent from the hub's UI).
+    Operator,
+    /// An agent session's signed message (`message_session`): its name.
+    Agent(String),
+    /// Relayed by the hub or the harness, nobody's answer: a watch, a hub
+    /// notice, a background task's result, a subagent's hand-back, or an
+    /// agent's message from a session the hub no longer knows.
+    Relay,
+}
+
+/// Who sent `prompt`. An agent's message carries the hub's signed sender
+/// line (`From <name> ...: a message from that agent session`); a watch,
+/// its `[watch w... on ...]` line; a hub notice starts `From the flywheel
+/// hub`; Claude Code's own (a background task, a subagent's report) start
+/// `<task-notification>` or `<agent-message`. A hub delivery may arrive
+/// wrapped as `<pasted_content ...>`. Anything else is the operator's.
+pub fn sender_of_prompt(prompt: &str, known: impl Fn(&str) -> bool) -> Sender {
+    let text = unwrap_paste(prompt.trim_start());
+    if text.starts_with("<task-notification>") || text.starts_with("<agent-message") {
+        return Sender::Relay;
+    }
+    let first = text.lines().next().unwrap_or("");
+    if first.starts_with("From the flywheel hub") {
+        return Sender::Relay;
+    }
     if let Some(rest) = first.strip_prefix("From ")
         && first.ends_with("agent session")
     {
@@ -404,11 +427,40 @@ pub fn by_of_prompt(prompt: &str, known: impl Fn(&str) -> bool) -> String {
                 best = Some(&rest[..at]);
             }
         }
-        if let Some(name) = best {
-            return format!("agent:{name}");
-        }
+        return best.map_or(Sender::Relay, |name| Sender::Agent(name.to_owned()));
     }
-    "operator".to_owned()
+    if text.lines().any(is_watch_line) {
+        return Sender::Relay;
+    }
+    Sender::Operator
+}
+
+/// `prompt` without the `<pasted_content id="...">` wrapper Claude Code
+/// shows a long paste in (the whole prompt one paste), else `prompt`.
+fn unwrap_paste(prompt: &str) -> &str {
+    let Some(rest) = prompt.strip_prefix("<pasted_content") else {
+        return prompt;
+    };
+    let Some(open_end) = rest.find('>') else {
+        return prompt;
+    };
+    let body = &rest[open_end + 1..];
+    let body = body
+        .rfind("</pasted_content")
+        .map_or(body, |close| &body[..close]);
+    body.trim_start()
+}
+
+/// A watch's header line: `[watch w1234567 on `filter`] ...` or
+/// `[watch w1234567, every 6h] ...` (see [`crate::watch::Watch::text`]).
+fn is_watch_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("[watch w") else {
+        return false;
+    };
+    let id: String = rest.chars().take(7).collect();
+    id.len() == 7
+        && id.chars().all(|c| c.is_ascii_hexdigit())
+        && (rest[7..].starts_with(" on `") || rest[7..].starts_with(", "))
 }
 
 #[cfg(test)]
@@ -537,23 +589,52 @@ mod tests {
     }
 
     #[test]
-    fn an_agents_signed_message_is_its_answer_else_the_operators() {
+    fn a_prompt_is_the_operators_unless_an_agent_or_a_relay_sent_it() {
         let known = |n: &str| n == "lead" || n == "lead in x";
+        let agent = |n: &str| Sender::Agent(n.to_owned());
         assert_eq!(
-            by_of_prompt(
+            sender_of_prompt(
                 "From lead in x on b: a message from that agent session\n\nyes",
                 known
             ),
-            "agent:lead in x"
+            agent("lead in x")
         );
         assert_eq!(
-            by_of_prompt(
+            sender_of_prompt(
                 "From lead in flywheel: a message from that agent session\n\ngo",
                 known
             ),
-            "agent:lead"
+            agent("lead")
         );
-        assert_eq!(by_of_prompt("From lead: hello", known), "operator");
-        assert_eq!(by_of_prompt("yes, push it", known), "operator");
+        // Wrapped as a paste, as Claude Code shows a long delivery.
+        assert_eq!(
+            sender_of_prompt(
+                "<pasted_content id=\"8be8\">\nFrom lead in flywheel: a message from that agent session\n\ngo\n</pasted_content id=\"8be8\">",
+                known
+            ),
+            agent("lead")
+        );
+        // A session the hub no longer knows: nobody's answer.
+        assert_eq!(
+            sender_of_prompt("From gone: a message from that agent session\n\nok", known),
+            Sender::Relay
+        );
+        for relayed in [
+            "<pasted_content id=\"a405\">\nA worker you lead changed state: read its report.\n\n[watch wbda3dfb on `children=abc state=done`] 1 event (cursor 1 .. 2):\n- 18:49 w turn.finished -> done\n</pasted_content id=\"a405\">",
+            "check the deploy\n\n[watch wabcdef0, every 6h] due a, b",
+            "From the flywheel hub: the operator approved your end request e1.",
+            "<task-notification>\n<task-id>b6zgr6quo</task-id>\n<status>completed</status>",
+            "<agent-message from=\"afb7c367d4611e1a2\">\n[Subagent hand-back] report",
+        ] {
+            assert_eq!(sender_of_prompt(relayed, known), Sender::Relay, "{relayed}");
+        }
+        for typed in [
+            "From lead: hello",
+            "yes, push it",
+            "<pasted_content id=\"1\">\n$ aws login\nlogged in\n</pasted_content id=\"1\">",
+            "what is [watch wnothex1 on `x`] about?",
+        ] {
+            assert_eq!(sender_of_prompt(typed, known), Sender::Operator, "{typed}");
+        }
     }
 }

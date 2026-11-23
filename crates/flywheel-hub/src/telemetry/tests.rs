@@ -651,6 +651,7 @@ fn the_fleet_lists_what_needs_a_person_first_and_counts_by_status() {
     };
     let turn = || What::TurnStarted {
         title: "work".to_owned(),
+        relayed: false,
     };
     let h2 = "a".repeat(32);
     push(HOST, "working", 1, 1_000, turn());
@@ -788,7 +789,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             items: 2,
         },
         What::SessionFinished { reason: None },
-        What::TurnStarted { title: "t".into() },
+        What::TurnStarted {
+            title: "t".into(),
+            relayed: false,
+        },
         What::TurnFinished { ending: None },
         What::TurnFailed {
             error: "e".into(),
@@ -1190,6 +1194,7 @@ fn ten_thousand_sessions_on_a_hundred_hosts_fold_and_list() {
                 let what = match round {
                     0 => What::TurnStarted {
                         title: format!("task {n}"),
+                        relayed: false,
                     },
                     1 | 3 | 5 => What::ToolStarted {
                         id: call,
@@ -1309,6 +1314,7 @@ fn a_new_session_arriving_as_one_large_batch_is_on_the_board_at_once() {
             what: if seq == 1 {
                 What::TurnStarted {
                     title: "long".to_owned(),
+                    relayed: false,
                 }
             } else if seq == 500 {
                 What::Compact {
@@ -1476,6 +1482,129 @@ fn a_declared_ask_holds_once_its_turn_ends() {
         ],
     );
     assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
+}
+
+/// A prompt the hub relayed (a worker's report, a watch): it answers
+/// nothing, as `Hub::note_prompt` judged it.
+fn relay(telemetry: &Telemetry, session: &str, at: i64, prompt: &str) {
+    let mut drafts = claude::hook("UserPromptSubmit", &json!({"prompt": prompt}), at);
+    for draft in &mut drafts {
+        if let What::TurnStarted { relayed, .. } = &mut draft.what {
+            *relayed = true;
+        }
+    }
+    telemetry.record(session, drafts);
+}
+
+#[test]
+fn a_relayed_prompt_does_not_answer_the_ask() {
+    let (_dir, telemetry) = open();
+    let decide = json!({"tool_name": claude::ASK_TOOL, "tool_use_id": "a1",
+        "tool_input": {"kind": "decide", "text": "Restart live on rh-node now?"}});
+    hooks(
+        &telemetry,
+        "lead",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "drive the release"})),
+            ("PreToolUse", decide),
+            ("Stop", json!({"last_assistant_message": "Over to you."})),
+        ],
+    );
+    let asked = telemetry.snapshot("lead").unwrap();
+    assert_eq!(asked.status, "asking");
+    let since = asked.since;
+
+    // A worker's report wakes the lead: it works on it, and the ask still
+    // waits on the operator (shown while that turn runs).
+    relay(
+        &telemetry,
+        "lead",
+        10_000,
+        "[watch wbda3dfb on `children=x`] 1 event",
+    );
+    let snap = telemetry.snapshot("lead").unwrap();
+    assert_eq!(snap.status, "working");
+    let held = snap.ask.expect("the ask shows while the relayed turn runs");
+    assert_eq!(held.text, "Restart live on rh-node now?");
+    // Its closing question does not replace the declared ask.
+    hooks(
+        &telemetry,
+        "lead",
+        11_000,
+        &[(
+            "Stop",
+            json!({"last_assistant_message": "Ruled on the report. Shall I start warehouse-3?"}),
+        )],
+    );
+    let snap = telemetry.snapshot("lead").unwrap();
+    assert_eq!((snap.status.as_str(), snap.since), ("asking", since));
+    assert_eq!(snap.ask.unwrap().text, "Restart live on rh-node now?");
+
+    // A relayed turn that fails, or that an interrupt cuts short, asks it
+    // again too.
+    relay(
+        &telemetry,
+        "lead",
+        20_000,
+        "<task-notification>done</task-notification>",
+    );
+    telemetry.record(
+        "lead",
+        claude::hook("StopFailure", &json!({"error": "overloaded"}), 21_000),
+    );
+    let snap = telemetry.snapshot("lead").unwrap();
+    assert_eq!((snap.status.as_str(), snap.since), ("asking", since));
+
+    // The operator's reply answers it.
+    hooks(
+        &telemetry,
+        "lead",
+        30_000,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "yes, restart"})),
+            ("Stop", json!({"last_assistant_message": "Restarted."})),
+        ],
+    );
+    let snap = telemetry.snapshot("lead").unwrap();
+    assert_eq!((snap.status.as_str(), snap.ask), ("done", None));
+}
+
+#[test]
+fn a_newer_declared_ask_replaces_the_one_a_relay_held() {
+    let (_dir, telemetry) = open();
+    let ask = |id: &str, text: &str| {
+        json!({"tool_name": claude::ASK_TOOL, "tool_use_id": id,
+            "tool_input": {"kind": "decide", "text": text}})
+    };
+    hooks(
+        &telemetry,
+        "lead",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            ("PreToolUse", ask("a1", "Deploy 0fe0a82a?")),
+            ("Stop", json!({"last_assistant_message": "Over to you."})),
+        ],
+    );
+    relay(
+        &telemetry,
+        "lead",
+        10_000,
+        "From the flywheel hub: a notice",
+    );
+    hooks(
+        &telemetry,
+        "lead",
+        11_000,
+        &[
+            ("PreToolUse", ask("a2", "Deploy 665691e6 instead?")),
+            ("Stop", json!({"last_assistant_message": "Over to you."})),
+        ],
+    );
+    let snap = telemetry.snapshot("lead").unwrap();
+    assert_eq!(snap.status, "asking");
+    assert_eq!(snap.ask.unwrap().text, "Deploy 665691e6 instead?");
 }
 
 #[test]
@@ -1654,6 +1783,7 @@ fn captured_runs_are_rolled_up_by_batch_parent_or_outside() {
                 at,
                 What::TurnStarted {
                     title: "go".to_owned(),
+                    relayed: false,
                 },
             ),
             Draft::new(
@@ -1771,6 +1901,7 @@ fn a_store_from_before_rollups_gains_the_batch_column() {
             1,
             What::TurnStarted {
                 title: "go".to_owned(),
+                relayed: false,
             },
         )],
     );

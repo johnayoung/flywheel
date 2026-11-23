@@ -126,6 +126,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
         })],
         "UserPromptSubmit" => vec![main(What::TurnStarted {
             title: prompt_title(str_of(payload, "prompt").unwrap_or_default()),
+            relayed: false,
         })],
         "Stop" => vec![main(What::TurnFinished {
             ending: str_of(payload, "last_assistant_message").and_then(summary::ending),

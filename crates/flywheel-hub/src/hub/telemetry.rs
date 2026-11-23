@@ -181,12 +181,15 @@ impl Hub {
                 .record(session, claude::status_line(payload, now_ms()));
             return true;
         }
-        if event == "UserPromptSubmit"
-            && let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str)
-        {
-            self.note_prompt(session, prompt);
-        }
+        let relayed = event == "UserPromptSubmit"
+            && payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|prompt| !self.note_prompt(session, prompt));
         let mut drafts = claude::hook(event, payload, now_ms());
+        if relayed {
+            mark_relayed(&mut drafts);
+        }
         if let Ok(record) = self.store().session(session) {
             name_session(&mut drafts, SessionKind::Claude, record);
         }
@@ -215,10 +218,11 @@ impl Hub {
         // A turn's prompt answers what the last one asked (Codex logs
         // only its title).
         if let Some(title) = drafts.iter().find_map(|d| match &d.what {
-            What::TurnStarted { title } => Some(title.clone()),
+            What::TurnStarted { title, .. } => Some(title.clone()),
             _ => None,
-        }) {
-            self.note_prompt(&record.id, &title);
+        }) && !self.note_prompt(&record.id, &title)
+        {
+            mark_relayed(&mut drafts);
         }
         if drafts.iter().any(|d| matches!(d.what, What::Usage { .. })) {
             let priced = self
@@ -413,6 +417,16 @@ fn links_of(record: &SessionRecord) -> crate::telemetry::SessionLinks {
         continues: record.continues.clone(),
         opened_by: record.opened_by.clone(),
         ..Default::default()
+    }
+}
+
+/// Mark the prompt in `drafts` relayed: it answers nothing the session
+/// asked (see [`Hub::note_prompt`]).
+fn mark_relayed(drafts: &mut [Draft]) {
+    for draft in drafts {
+        if let What::TurnStarted { relayed, .. } = &mut draft.what {
+            *relayed = true;
+        }
     }
 }
 

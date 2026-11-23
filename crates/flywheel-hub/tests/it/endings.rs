@@ -2941,6 +2941,15 @@ async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
     // other left out and answered in its terminal.
     let a = hub.claude("asker-a", None, json!({})).await;
     let b = hub.claude("asker-b", None, json!({})).await;
+    // The operator puts asker-a under the lead: the lead answers for it.
+    let (status, view) = hub
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/sessions/{}/owner", a.id),
+            Some(json!({ "owner": "lead" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
     for agent in [&a, &b] {
         agent
             .hook("UserPromptSubmit", json!({"prompt": "deploy"}))
@@ -2995,7 +3004,7 @@ async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
     let kept = decisions(&hub, &format!("session={}", b.id)).await;
     assert_eq!(kept[0]["answer"], "us-east, it is cheaper");
     assert_eq!(kept[0]["by"], "operator");
-    // An agent's signed message that answers is the agent's.
+    // Its lead's signed message that answers is the lead's.
     a.hook("Stop", json!({"last_assistant_message": "Ship it now?"}))
         .await;
     a.hook(
@@ -3006,9 +3015,42 @@ async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
     let kept = decisions(&hub, "session=asker-a&kind=needs_input").await;
     assert_eq!(kept[0]["by"], "agent:lead", "{kept:?}");
     assert_eq!(kept[0]["question"], "Ship it now?");
+    // Anything else that arrives while it asks answers nothing: a
+    // background task's result, a watch, a session that does not lead it.
+    a.hook(
+        "Stop",
+        json!({"last_assistant_message": "Restart live now?"}),
+    )
+    .await;
+    for relayed in [
+        "<task-notification>\n<status>completed</status>\n</task-notification>",
+        "<pasted_content id=\"a405\">\nA worker changed state.\n\n[watch wbda3dfb on `children=x`] 1 event\n</pasted_content id=\"a405\">",
+        "From asker-b in repo: a message from that agent session\n\nFYI, nothing needed",
+    ] {
+        a.hook("UserPromptSubmit", json!({"prompt": relayed})).await;
+        a.hook("Stop", json!({"last_assistant_message": "Noted."}))
+            .await;
+    }
+    let kept = decisions(&hub, "session=asker-a&kind=needs_input").await;
+    assert_eq!(kept.len(), 1, "a relay answered it: {kept:?}");
+    let waiting = hub.get("/api/holds").await.to_string();
+    assert!(waiting.contains("Restart live now?"), "{waiting}");
+    // The operator's reply does.
+    a.hook("UserPromptSubmit", json!({"prompt": "yes, restart"}))
+        .await;
+    let kept = decisions(&hub, "session=asker-a&kind=needs_input").await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(
+        (&kept[0]["question"], &kept[0]["answer"], &kept[0]["by"]),
+        (
+            &json!("Restart live now?"),
+            &json!("yes, restart"),
+            &json!("operator")
+        )
+    );
     // Newest first, all kinds, and only since a time.
     let all = decisions(&hub, "").await;
-    assert_eq!(all.len(), 6);
+    assert_eq!(all.len(), 7);
     let newest = all[0]["at"].as_i64().unwrap();
     assert_eq!(decisions(&hub, &format!("since={newest}")).await.len(), 1);
     let (status, _) = hub

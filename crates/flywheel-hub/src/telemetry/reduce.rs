@@ -251,6 +251,11 @@ pub struct SessionState {
     /// running turn, or held since the last one ended on it.
     #[serde(default)]
     ask: Option<Ask>,
+    /// An ask set aside while a relayed prompt's turn runs (a worker's
+    /// report, a watch): still the operator's to answer, back when that
+    /// turn ends.
+    #[serde(default)]
+    held: Option<Ask>,
     #[serde(default)]
     blocked_ms: u64,
     #[serde(default)]
@@ -366,7 +371,9 @@ pub struct Snapshot {
     pub blocked_on: Option<WaitReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tool: Option<String>,
-    /// What an `asking` session asks for.
+    /// What an `asking` session asks for; while a relayed prompt's turn
+    /// runs (a worker's report, a watch), the ask that still waits on the
+    /// operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<Ask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,6 +577,7 @@ impl SessionState {
                         // Another conversation (`/clear`): asks nothing,
                         // and the old one's subagents are gone.
                         self.ask = None;
+                        self.held = None;
                         if self.conversation.is_some() {
                             self.finish_subagents(ts);
                         }
@@ -584,6 +592,7 @@ impl SessionState {
             What::Continued { successor } | What::Replaced { successor } => {
                 // Its work went on there: whatever it asked is answered.
                 self.ask = None;
+                self.held = None;
                 self.continued_by = Some(successor.clone());
             }
             // Records of the session's lifecycle and queue: the timeline
@@ -600,12 +609,13 @@ impl SessionState {
                 // until then).
                 self.close_wait(ts);
                 self.finish_turn(ts, WorkStatus::Cancelled);
+                self.restore_held();
                 self.finish_subagents(ts);
                 self.open.clear();
                 self.compacting = None;
                 self.ended = true;
             }
-            What::TurnStarted { title } => {
+            What::TurnStarted { title, relayed } => {
                 self.close_wait(ts);
                 self.ended = false;
                 // The prompt's text arriving after its turn began (Codex
@@ -621,8 +631,17 @@ impl SessionState {
                     event.work = Some(id);
                     return;
                 }
-                // A prompt answers whatever was asked.
-                self.ask = None;
+                if !*relayed {
+                    // A prompt answers whatever was asked.
+                    self.ask = None;
+                    self.held = None;
+                } else if self.turn.is_none()
+                    && let Some(ask) = self.ask.take()
+                {
+                    // A relayed one answers nothing: what was asked waits
+                    // it out.
+                    self.held = Some(ask);
+                }
                 self.compacting = None;
                 // A prompt while a turn runs (one typed while the agent
                 // works, a background task's result) is taken into that
@@ -638,13 +657,24 @@ impl SessionState {
             What::TurnFinished { ending } => {
                 self.close_wait(ts);
                 event.work = self.turn.clone();
-                self.ask = self.ask_at_end(ending.as_deref(), ts);
+                let ended_on = self.ask_at_end(ending.as_deref(), ts);
+                self.ask = match (ended_on, self.held.take()) {
+                    // A closing question does not replace a declared ask
+                    // still waiting; a declared one does.
+                    (Some(new), Some(held))
+                        if held.source == "declared" && new.source != "declared" =>
+                    {
+                        Some(held)
+                    }
+                    (Some(new), _) => Some(new),
+                    (None, held) => held,
+                };
                 self.last_turn_failed = false;
                 self.compacting = None;
                 self.finish_turn(ts, WorkStatus::Done);
             }
             What::TurnFailed { error, detail } => {
-                self.ask = None;
+                self.ask = self.held.take();
                 self.close_wait(ts);
                 event.work = self.turn.clone();
                 self.errors += 1;
@@ -793,6 +823,7 @@ impl SessionState {
                 if interrupted {
                     self.close_wait(ts);
                     self.finish_turn(ts, WorkStatus::Cancelled);
+                    self.restore_held();
                 }
             }
             What::Asked {
@@ -1059,6 +1090,15 @@ impl SessionState {
             source: "inferred".to_owned(),
             since: ts,
         })
+    }
+
+    /// A turn ended without its Stop: an ask it set aside is asked again.
+    fn restore_held(&mut self) {
+        if let Some(held) = self.held.take()
+            && self.ask.is_none()
+        {
+            self.ask = Some(held);
+        }
     }
 
     fn finish_turn(&mut self, ts: i64, status: WorkStatus) {
@@ -1375,7 +1415,11 @@ impl SessionState {
             since,
             blocked_on: self.wait.as_ref().map(|w| w.reason),
             blocked_tool: self.wait.as_ref().and_then(|w| w.tool.clone()),
-            ask: (status == "asking").then(|| self.ask.clone()).flatten(),
+            ask: if status == "asking" {
+                self.ask.clone()
+            } else {
+                self.held.clone()
+            },
             started: self.started,
             last_ts: self.last_ts,
             turns: self.turns,

@@ -86,6 +86,7 @@ fn event_msg(payload: &Value, ts: i64) -> Vec<Draft> {
         // The prompt's text follows in its own line and titles the turn.
         Some("task_started") => vec![draft(What::TurnStarted {
             title: String::new(),
+            relayed: false,
         })],
         Some("task_complete") => vec![draft(What::TurnFinished {
             ending: str_of(payload, "last_agent_message").and_then(summary::ending),
@@ -95,6 +96,7 @@ fn event_msg(payload: &Value, ts: i64) -> Vec<Draft> {
             .map(|text| {
                 draft(What::TurnStarted {
                     title: summary::text(text),
+                    relayed: false,
                 })
             })
             .into_iter()
@@ -114,6 +116,7 @@ fn event_msg(payload: &Value, ts: i64) -> Vec<Draft> {
                 .join(" ");
             vec![draft(What::TurnStarted {
                 title: summary::text(&text),
+                relayed: false,
             })]
         }
         Some("token_count") => token_count(payload, ts),

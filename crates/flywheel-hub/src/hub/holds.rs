@@ -492,29 +492,42 @@ impl Hub {
         done
     }
 
-    /// A prompt arrived in session `session`: when it was asking, the
-    /// prompt answers its ask (call before the prompt reaches telemetry).
-    pub(crate) fn note_prompt(&self, session: &str, prompt: &str) {
-        let Some(snap) = self.telemetry().snapshot(session) else {
-            return;
+    /// A prompt arrived in session `session` (call before the prompt
+    /// reaches telemetry): whether it answers what the session asks, the
+    /// operator's or its lead's message, recorded as the ask's answer when
+    /// it was asking. A relayed one (a watch, a hub notice, a background
+    /// task's result, another session's message) answers nothing: the ask
+    /// stays the operator's.
+    pub(crate) fn note_prompt(&self, session: &str, prompt: &str) -> bool {
+        let (record, by) = {
+            let store = self.store();
+            let sessions = store.sessions();
+            let Some(record) = sessions.iter().find(|r| r.id == session).cloned() else {
+                return true;
+            };
+            let sender =
+                holds::sender_of_prompt(prompt, |n| sessions.iter().any(|known| known.name == n));
+            let by = match sender {
+                holds::Sender::Operator => "operator".to_owned(),
+                holds::Sender::Agent(name) => {
+                    let lead = super::endings::effective_owner(&record, sessions);
+                    let leads = sessions
+                        .iter()
+                        .any(|s| s.name == name && lead.as_deref() == Some(s.id.as_str()));
+                    if !leads {
+                        return false;
+                    }
+                    format!("agent:{name}")
+                }
+                holds::Sender::Relay => return false,
+            };
+            (record, by)
         };
-        if snap.status != "asking" {
-            return;
-        }
-        let Some(ask) = snap.ask else {
-            return;
-        };
-        let Ok(record) = self.store().session(session).cloned() else {
-            return;
+        // Asking, or a relayed prompt's turn holds the ask aside.
+        let Some(ask) = self.telemetry().snapshot(session).and_then(|snap| snap.ask) else {
+            return true;
         };
         let hold = self.ask_hold(&record);
-        let names: Vec<String> = self
-            .store()
-            .sessions()
-            .iter()
-            .map(|r| r.name.clone())
-            .collect();
-        let by = holds::by_of_prompt(prompt, |n| names.iter().any(|known| known == n));
         let id = format!("ask:{session}:{}", ask.since);
         let batch = self.take_batch(&id);
         // Batches of this session's earlier asks, answered otherwise.
@@ -536,6 +549,7 @@ impl Hub {
             by,
             batch,
         });
+        true
     }
 
     /// A Claude Code permission request the hub was told of moved on

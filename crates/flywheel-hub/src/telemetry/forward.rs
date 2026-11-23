@@ -186,6 +186,7 @@ mod tests {
             item: None,
             what: What::TurnStarted {
                 title: "fix the build".to_owned(),
+                relayed: false,
             },
         };
         let events = vec![event(1), event(2)];

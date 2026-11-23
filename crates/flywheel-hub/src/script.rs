@@ -1617,6 +1617,10 @@ pub(crate) struct ContinueArgs {
     /// session's numbered on (`docs` -> `docs 2`).
     #[arg(long)]
     name: Option<String>,
+    /// Start it although an earlier successor of the session still runs
+    /// (refused otherwise).
+    #[arg(long)]
+    another: bool,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -1643,7 +1647,12 @@ pub(crate) fn continue_session(
         conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/continue"),
-            Some(&json!({ "prompt": prompt, "handoff": args.handoff, "name": args.name })),
+            Some(&json!({
+                "prompt": prompt,
+                "handoff": args.handoff,
+                "name": args.name,
+                "another": args.another,
+            })),
         )
     });
     match result {

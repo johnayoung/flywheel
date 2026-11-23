@@ -42,7 +42,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST | `/api/changes/{id}/close` | as `/close` above |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running. `{"never"}`: opt out of upgrade relaunches |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
-| POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |
+| POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?,"another"?}` (default: the only pending): linked successor, 201; 409 one runs |
 | DELETE | `/api/sessions/{id}/handoffs/{handoff}` | dismiss a pending handoff; 204 |
 | POST / DELETE | `/api/sessions/{id}/starts/{start}` | start `{"prompt"?,"name"?}` (201) / decline (204) a waiting agent start |
 | POST / DELETE | `/api/sessions/{id}/ends/{end}` | approve (200) / decline (204) an agent's end |

@@ -1053,11 +1053,30 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
         .await
         .unwrap();
     assert_eq!(third["result"]["isError"], false, "{third}");
-    let (status, polished) = hub
+    // Its first successor still runs: a second is refused, naming it, and
+    // the handoff stays; asked for another anyway, it starts.
+    assert_eq!(
+        hub.get(&format!("/api/sessions/{next_id}")).await["state"],
+        "running"
+    );
+    let (status, refused) = hub
         .call(
             reqwest::Method::POST,
             &format!("/api/sessions/{sid}/continue"),
             Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused.to_string().contains("route work"), "{refused}");
+    assert_eq!(
+        pending(&hub.get(&format!("/api/sessions/{sid}")).await).len(),
+        1
+    );
+    let (status, polished) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({"another": true})),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{polished}");
@@ -1076,6 +1095,33 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
         .await
         .unwrap();
     assert_eq!(fourth["result"]["isError"], false, "{fourth}");
+    let fourth_id = pending(&hub.get(&format!("/api/sessions/{sid}")).await)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A revision under the same name (case aside) replaces it, and says so.
+    let revised: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call("handoff", json!({"prompt": "Goal: ship v2.", "name": "X"})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revised["result"]["isError"], false, "{revised}");
+    let said = revised["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        said.contains(&format!(
+            "replaces your earlier pending handoff {fourth_id}"
+        )),
+        "{said}"
+    );
+    let now = pending(&hub.get(&format!("/api/sessions/{sid}")).await);
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_eq!(now[0]["prompt"], "Goal: ship v2.");
     let (status, _) = hub
         .call(
             reqwest::Method::POST,

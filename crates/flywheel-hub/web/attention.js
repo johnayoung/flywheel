@@ -389,7 +389,8 @@ window.FwHubAttention = function (ctx) {
   // Start a handoff: a new session in the same directory continues the
   // work; it opens. `pending`: the kept handoff (its prompt and name
   // unless `edits` change them); none: a handoff from before they were
-  // kept, from `edits.prompt`.
+  // kept, from `edits.prompt`. A successor that still runs makes the hub
+  // refuse (409); the operator may start another anyway.
   async function startSuccessor(session, pending, edits, button) {
     if (button) button.disabled = true;
     try {
@@ -397,7 +398,21 @@ window.FwHubAttention = function (ctx) {
       if (pending) body.handoff = pending.id;
       if (edits && edits.prompt != null && (!pending || edits.prompt !== pending.prompt)) body.prompt = edits.prompt;
       if (edits && edits.name && (!pending || edits.name !== (pending.name || ""))) body.name = edits.name;
-      const next = await ctx.api("POST", `/api/sessions/${encodeURIComponent(session.id)}/continue`, body);
+      const url = `/api/sessions/${encodeURIComponent(session.id)}/continue`;
+      let next;
+      try {
+        next = await ctx.api("POST", url, body);
+      } catch (error) {
+        if (error.status !== 409 || !ctx.confirm) throw error;
+        const sure = await ctx.confirm({
+          kicker: "handoff",
+          title: `${session.name} already has a running successor`,
+          body: `${error.message}. Start a second session on the same work anyway?`,
+          ok: "Start another",
+        });
+        if (!sure) return false;
+        next = await ctx.api("POST", url, { ...body, another: true });
+      }
       handoffs.delete(session.id);
       ctx.toast(`Started ${next.name}, continuing ${session.name}`);
       // The new session is listed before it is opened.

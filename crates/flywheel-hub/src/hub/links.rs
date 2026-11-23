@@ -5,9 +5,11 @@
 //! An agent proposes a handoff with the hub's `handoff` tool
 //! ([`Hub::propose_handoff`]): its prompt for a fresh session is kept on
 //! its session record and waits on the operator's Needs-you list until it
-//! is started or dismissed (never cleared by a prompt, a view, or another
-//! handoff); continuing starts that session in the same directory
-//! (worktree, model, account) with that prompt, linked both ways. A message is typed into
+//! is started or dismissed (never cleared by a prompt or a view; a newer
+//! handoff with the same name replaces it); continuing starts that session
+//! in the same directory (worktree, model, account) with that prompt,
+//! linked both ways, and is refused while an earlier successor still runs
+//! unless the operator asks for another. A message is typed into
 //! the recipient the way a broadcast is, under a provenance line naming
 //! its sender: now when the recipient is at rest, else queued for when
 //! its turn is done.
@@ -55,14 +57,16 @@ fn described(handoff: &PendingHandoff) -> String {
 impl Hub {
     /// Agent session `id` proposes continuing its work in a fresh session
     /// from `prompt` (the `handoff` tool): kept on its record until the
-    /// operator starts or dismisses it.
+    /// operator starts or dismisses it, in place of any pending one with
+    /// the same name (a revision). The kept handoff and the ones it
+    /// replaced.
     pub fn propose_handoff(
         &self,
         id: &str,
         prompt: &str,
         name: Option<&str>,
         reason: Option<&str>,
-    ) -> Result<PendingHandoff, HubError> {
+    ) -> Result<(PendingHandoff, Vec<PendingHandoff>), HubError> {
         let from = self.store().session(id)?.clone();
         if !from.runs_agent() {
             return Err(StateError::Invalid(format!(
@@ -89,9 +93,9 @@ impl Hub {
             prompt,
             created_at: Utc::now(),
         };
-        self.store().add_handoff(&from.id, handoff.clone())?;
+        let replaced = self.store().put_handoff(&from.id, handoff.clone())?;
         self.emit(HubEvent::Sessions);
-        Ok(handoff)
+        Ok((handoff, replaced))
     }
 
     /// Drop session `id`'s pending handoff `handoff` unstarted.
@@ -107,13 +111,21 @@ impl Hub {
     /// `handoff` (default: the only one pending). The name is `name`, else
     /// the handoff's, made unique, else the predecessor's numbered on. The
     /// two are linked, and the handoff it started is no longer pending.
+    /// While a successor of `id` still runs, another is refused (a
+    /// conflict naming it) unless `another` says to start one anyway.
     pub fn continue_session(
         self: &Arc<Self>,
         id: &str,
         prompt: Option<&str>,
         handoff: Option<&str>,
         name: Option<&str>,
+        another: bool,
     ) -> Result<SessionView, HubError> {
+        // Held through the launch: two starts at once see each other.
+        let _gate = self
+            .start_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let from = self.store().session(id)?.clone();
         if !from.runs_agent() {
             return Err(StateError::Invalid(format!(
@@ -190,6 +202,28 @@ impl Hub {
                 from.cwd.display()
             ))
             .into());
+        }
+        // The request is sound; one successor at a time, unless asked.
+        if !another {
+            let store = self.store();
+            let running: Vec<&str> = store
+                .sessions()
+                .iter()
+                .filter(|s| {
+                    s.continues.as_deref() == Some(from.id.as_str())
+                        && s.state == SessionState::Running
+                })
+                .map(|s| s.name.as_str())
+                .collect();
+            if !running.is_empty() {
+                return Err(StateError::Conflict(format!(
+                    "{} already continues {}'s work and still runs: end it or dismiss this \
+                     handoff, or start another anyway",
+                    running.join(", "),
+                    from.name
+                ))
+                .into());
+            }
         }
         let command = vec![
             self.agent_program(from.kind)?

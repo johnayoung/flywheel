@@ -206,6 +206,9 @@ pub(super) struct ContinueRequest {
     /// The new session's name; default: the handoff's, else the old
     /// session's numbered on.
     name: Option<String>,
+    /// Start it although an earlier successor still runs (else 409).
+    #[serde(default)]
+    another: bool,
 }
 
 /// Start a new session that continues an agent session's work (its
@@ -222,6 +225,7 @@ pub(super) async fn continue_session(
             request.prompt.as_deref(),
             request.handoff.as_deref(),
             request.name.as_deref(),
+            request.another,
         )
     })
     .await?;

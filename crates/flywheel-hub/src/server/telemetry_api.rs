@@ -398,14 +398,24 @@ impl mcp::Host for AgentHost {
         name: Option<&str>,
         reason: Option<&str>,
     ) -> Result<String, String> {
-        let kept = self
+        let (kept, replaced) = self
             .hub
             .propose_handoff(&self.session, prompt, name, reason)
             .map_err(|e| e.to_string())?;
+        let replaced = match replaced.as_slice() {
+            [] => String::new(),
+            old => format!(
+                " It replaces your earlier pending handoff {} with the same name.",
+                old.iter()
+                    .map(|h| h.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         Ok(format!(
             "Handoff {hid} is saved on the operator's Needs-you list; they start the new session \
-             from it. End your turn now. If it does not show in Needs you, the operator can run: \
-             fw hub continue {session} --handoff {hid}",
+             from it.{replaced} End your turn now. If it does not show in Needs you, the operator \
+             can run: fw hub continue {session} --handoff {hid}",
             hid = kept.id,
             session = self.session,
         ))

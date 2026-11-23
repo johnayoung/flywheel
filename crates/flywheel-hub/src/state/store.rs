@@ -539,6 +539,32 @@ impl HubStore {
         })
     }
 
+    /// Add `handoff` to session `id`'s pending ones in place of any with
+    /// the same name, case aside (two unnamed ones count as the same): a
+    /// revised handoff replaces the one it revises. The replaced ones are
+    /// returned.
+    pub fn put_handoff(
+        &mut self,
+        id: &str,
+        handoff: PendingHandoff,
+    ) -> Result<Vec<PendingHandoff>, StateError> {
+        let index = self.session_index(id)?;
+        let key = |h: &PendingHandoff| h.name.as_deref().map(str::to_lowercase);
+        let wanted = key(&handoff);
+        let previous = self.doc.sessions[index].handoffs.clone();
+        let (replaced, mut kept): (Vec<_>, Vec<_>) =
+            previous.iter().cloned().partition(|h| key(h) == wanted);
+        if kept.len() >= MAX_PENDING_HANDOFFS {
+            return Err(StateError::Invalid(format!(
+                "{MAX_PENDING_HANDOFFS} handoffs already wait on the operator: start or dismiss one first"
+            )));
+        }
+        kept.push(handoff);
+        self.doc.sessions[index].handoffs = kept;
+        self.save_or_rollback(|doc| doc.sessions[index].handoffs = previous)?;
+        Ok(replaced)
+    }
+
     /// Remove session `id`'s pending handoff `handoff`; it is returned.
     pub fn remove_handoff(
         &mut self,

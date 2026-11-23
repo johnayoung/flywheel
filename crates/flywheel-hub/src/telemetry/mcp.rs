@@ -55,6 +55,8 @@ pub const CANCEL_TOOL: &str = "cancel_message";
 pub const GIVE_TOOL: &str = "give_session";
 /// The label tool's name on the server.
 pub const LABEL_TOOL: &str = "label";
+/// The rulings tool's name on the server.
+pub const RULING_TOOL: &str = "record_ruling";
 /// The watch tools' names on the server.
 pub const WATCH_TOOL: &str = "watch";
 pub const UNWATCH_TOOL: &str = "unwatch";
@@ -158,6 +160,8 @@ pub trait Host {
         change: &crate::labels::Change,
         cond: Option<&crate::labels::Cond>,
     ) -> Result<String, String>;
+    /// Record, retire, or list the caller's operator rulings.
+    fn record_ruling(&self, action: crate::rulings::RulingAction) -> Result<String, String>;
     /// Arm a watch that wakes the caller when the log matches `filter`,
     /// or at a time (`at`, `every`).
     fn watch(
@@ -214,7 +218,9 @@ parallel work to a new agent session, call mcp__flywheel__start_session (handoff
 continuing your own work); to wait on the sessions you started, call mcp__flywheel__watch once \
 (for example filter \"children state=done|blocked|failed\") and end your turn instead of polling \
 session_status; to retire one, call mcp__flywheel__end_session or \
-mcp__flywheel__replace_session, never a shell kill. Do not mention these tools or the board in \
+mcp__flywheel__replace_session, never a shell kill. When the operator rules on how the work goes \
+(a decision, a rule, what not to do), call mcp__flywheel__record_ruling with their words: the hub \
+says it again after compaction and to your successor. Do not mention these tools or the board in \
 your replies.";
 
 fn tool() -> Value {
@@ -627,6 +633,28 @@ fn label_tool() -> Value {
     })
 }
 
+fn ruling_tool() -> Value {
+    json!({
+        "name": RULING_TOOL,
+        "title": "Record an operator ruling",
+        "description": "Keep a ruling the operator gave you (how the work goes, what not to do, \
+                        a decision): the hub says your rulings again after each compaction and \
+                        hands them to your successor, so they hold when your context is \
+                        summarized. text: the operator's words, quoted, not your summary. topic: \
+                        a short key; a later ruling on it replaces this one. retire: an id or \
+                        topic that no longer holds. No arguments: list them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "The operator's ruling, in their words." },
+                "topic": { "type": "string", "description": "Optional: a short key (schema, merge:phase-2); replaces your ruling on it." },
+                "note": { "type": "string", "description": "Optional: one line of your own on what it means for the work." },
+                "retire": { "type": "string", "description": "Optional, instead of text: the id (r3) or topic of a ruling that no longer holds." }
+            }
+        }
+    })
+}
+
 fn watch_tool() -> Value {
     json!({
         "name": WATCH_TOOL,
@@ -906,6 +934,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 cancel_tool(),
                 give_tool(),
                 label_tool(),
+                ruling_tool(),
                 watch_tool(),
                 unwatch_tool(),
                 lease_tool(),
@@ -1060,6 +1089,31 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         Err(why) => text_result(format!("Not labelled: {why}"), true),
                     },
                 })
+            } else if name == Some(RULING_TOOL) {
+                let given = |key: &str| Some(arg(key).trim()).filter(|v| !v.is_empty());
+                let action = match (given("text"), given("retire")) {
+                    (Some(_), Some(_)) => Err("give text or retire, not both"),
+                    (Some(text), None) => Ok(crate::rulings::RulingAction::Record(
+                        crate::rulings::NewRuling {
+                            text: text.to_owned(),
+                            topic: given("topic").map(str::to_owned),
+                            note: given("note").map(str::to_owned),
+                        },
+                    )),
+                    (None, Some(which)) => {
+                        Ok(crate::rulings::RulingAction::Retire(which.to_owned()))
+                    }
+                    (None, None) => Ok(crate::rulings::RulingAction::List),
+                };
+                Ok(
+                    match action
+                        .map_err(str::to_owned)
+                        .and_then(|a| host.record_ruling(a))
+                    {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not recorded: {why}"), true),
+                    },
+                )
             } else if name == Some(WATCH_TOOL) {
                 let secs = |key: &str| {
                     args.get(key)
@@ -1324,6 +1378,9 @@ mod tests {
         ) -> Result<String, String> {
             Ok(format!("{to:?} {change:?} {cond:?}"))
         }
+        fn record_ruling(&self, action: crate::rulings::RulingAction) -> Result<String, String> {
+            Ok(format!("{action:?}"))
+        }
         fn watch(
             &self,
             filter: &str,
@@ -1535,6 +1592,7 @@ mod tests {
                 CANCEL_TOOL,
                 GIVE_TOOL,
                 LABEL_TOOL,
+                RULING_TOOL,
                 WATCH_TOOL,
                 UNWATCH_TOOL,
                 LEASE_TOOL,

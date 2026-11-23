@@ -19,6 +19,7 @@ mod links;
 mod log;
 mod relaunches;
 pub mod reviews;
+mod rulings;
 mod starts;
 pub use starts::{AgentStart, Opened};
 mod restore;

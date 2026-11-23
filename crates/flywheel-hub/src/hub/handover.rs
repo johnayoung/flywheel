@@ -37,7 +37,11 @@ impl Hub {
             .snapshot(from)
             .and_then(|snap| snap.ask)
             .filter(|ask| ask.prompt.is_none());
-        if children.is_empty() && ask.is_none() {
+        let rulings = self.ruling_lines(
+            from,
+            &format!("The operator's rulings {name} recorded (now yours; they still hold):"),
+        );
+        if children.is_empty() && ask.is_none() && rulings.is_empty() {
             return None;
         }
         let mut lines = vec![format!("--- Handed over by the hub from {name} ---")];
@@ -55,6 +59,7 @@ impl Hub {
                 ask.text
             ));
         }
+        lines.extend(rulings);
         Some(lines.join("\n"))
     }
 
@@ -104,8 +109,8 @@ impl Hub {
 
     /// What the hub puts back into agent session `id`'s context after a
     /// compaction (a `SessionStart` hook's additional context): the hub's
-    /// tools to load again, the sessions it leads, its watches, and what
-    /// it still asks the operator. Compaction keeps the task and drops how
+    /// tools to load again, the sessions it leads, its watches, what it
+    /// still asks the operator, and the operator's rulings it recorded. Compaction keeps the task and drops how
     /// to work; this is the state the hub owns, so it is said exactly.
     pub(crate) fn compaction_brief(&self, id: &str) -> Option<String> {
         self.store().session(id).ok()?;
@@ -150,14 +155,21 @@ impl Hub {
                 ask.text
             ));
         }
+        lines.extend(self.ruling_lines(
+            id,
+            "The operator's rulings you recorded (verbatim; they still hold, whatever the \
+             summary above says):",
+        ));
         Some(lines.join("\n"))
     }
 
     /// Pass agent session `from`'s children and watches to `to` (a
     /// session continuing its work while `from` stays on the hub): each
     /// session `from` controls is given to `to`, and its watches move
-    /// (a watch on its children then watches `to`'s). Best effort.
+    /// (a watch on its children then watches `to`'s), and so do its
+    /// rulings. Best effort.
     pub(crate) fn hand_over(&self, from: &str, to: &str) {
+        self.inherit_rulings(from, to);
         for child in self.controlled_by(from) {
             if child.id == to {
                 continue;

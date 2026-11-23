@@ -90,6 +90,7 @@ pub mod restore;
 pub mod review;
 pub mod review_cli;
 pub mod reviews;
+pub mod rulings;
 pub mod script;
 pub mod search;
 pub mod search_cli;

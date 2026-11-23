@@ -620,6 +620,13 @@ impl Hub {
         {
             lines.push(format!("cost: ${cost:.2}"));
         }
+        if !target.rulings.is_empty() {
+            lines.push(format!(
+                "operator rulings it holds: {}",
+                target.rulings.len()
+            ));
+            lines.extend(crate::rulings::lines(&target.rulings));
+        }
         if let Some(s) = &snap {
             if let Some(plan) = &s.plan {
                 let mut line = format!("plan: {} of {} done", plan.done, plan.total);
@@ -717,6 +724,7 @@ mod tests {
             continues: None,
             opened_by: opened_by.map(str::to_owned),
             handoffs: Vec::new(),
+            rulings: Vec::new(),
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,

@@ -3059,3 +3059,95 @@ async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leads_rulings_survive_its_compaction_and_pass_to_its_successor() {
+    let mut hub = TestHub::start().await;
+    let top = hub.claude("top", None, json!({})).await;
+    hub.policy(&top, "allowed").await;
+    let lead = hub.claude("lead", Some(&top), json!({})).await;
+    for agent in [&top, &lead] {
+        agent.turn().await;
+    }
+    let ruling = "record_ruling";
+    lead.ok(
+        ruling,
+        json!({"text": "Keep the old schema for phase 2.", "topic": "schema"}),
+    )
+    .await;
+    lead.ok(
+        ruling,
+        json!({"text": "Never merge without a review.", "note": "covers workers too"}),
+    )
+    .await;
+    // A later ruling on a topic replaces the earlier one.
+    let said = lead
+        .ok(
+            ruling,
+            json!({"text": "Phase 2 moves to schema v2.", "topic": "Schema"}),
+        )
+        .await;
+    assert!(said.starts_with("Recorded r3 (replaces r1)."), "{said}");
+    assert!(!said.contains("old schema"), "{said}");
+    lead.ok(ruling, json!({"text": "No deploys after 18:00."}))
+        .await;
+    let said = lead.ok(ruling, json!({"retire": "r4"})).await;
+    assert!(said.starts_with("Retired r4."), "{said}");
+    assert!(!said.contains("18:00"), "{said}");
+    let (refused, why) = lead.tool(ruling, json!({"retire": "r4"})).await;
+    assert!(refused, "{why}");
+    let (refused, why) = lead
+        .tool(ruling, json!({"text": "x", "retire": "r2"}))
+        .await;
+    assert!(refused, "{why}");
+    let status = top.ok("session_status", json!({"to": "lead"})).await;
+    assert!(status.contains("operator rulings it holds: 2"), "{status}");
+
+    // After a compaction the hub says them again, verbatim.
+    let env = lead.env(None).await;
+    let compacted = report::send(
+        std::path::Path::new(&env[report::SOCKET_ENV]),
+        &flywheel_hub::report::Report {
+            session: env[report::SESSION_ENV].clone(),
+            secret: env[report::SECRET_ENV].clone(),
+            source: "claude".into(),
+            event: "SessionStart".into(),
+            detail: None,
+            payload: Some(json!({"source": "compact"})),
+        },
+    )
+    .unwrap()
+    .expect("a compacted session gets a brief");
+    assert!(
+        compacted.contains("The operator's rulings you recorded"),
+        "{compacted}"
+    );
+    assert!(
+        compacted.contains("r3 [schema] \"Phase 2 moves to schema v2.\""),
+        "{compacted}"
+    );
+    assert!(
+        compacted.contains("\"Never merge without a review.\" -- covers workers too (lead,"),
+        "{compacted}"
+    );
+    assert!(!compacted.contains("old schema"), "{compacted}");
+
+    // Its successor is told them and holds them.
+    top.ok(
+        "replace_session",
+        json!({"to": "lead", "name": "lead-2", "prompt": "Carry on.", "final_prompt": "Wrap up."}),
+    )
+    .await;
+    lead.typed_has("Wrap up.").await;
+    lead.turn().await;
+    hub.gone(&lead.id).await;
+    let next = hub.named("lead-2").await.expect("the successor started");
+    let next = hub.agent(&next);
+    next.env(None).await;
+    let prompt = argv(&next).join(" ");
+    assert!(prompt.contains("Phase 2 moves to schema v2."), "{prompt}");
+    next.turn().await;
+    let held = next.ok(ruling, json!({})).await;
+    assert!(held.starts_with("Your rulings (2):"), "{held}");
+    assert!(held.contains("Never merge without a review."), "{held}");
+}

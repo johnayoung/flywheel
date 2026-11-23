@@ -1634,6 +1634,7 @@ impl Hub {
             r.owner = Some(owner);
             r.continues = Some(continues);
         })?;
+        self.inherit_rulings(&record.id, &new_id);
         self.refresh_parents();
         self.emit(HubEvent::Sessions);
         Ok(new_id)
@@ -2180,6 +2181,7 @@ mod tests {
             continues: None,
             opened_by: opened_by.map(str::to_owned),
             handoffs: Vec::new(),
+            rulings: Vec::new(),
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,

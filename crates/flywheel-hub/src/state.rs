@@ -326,6 +326,10 @@ pub struct SessionRecord {
     /// the rest by the operator and agents.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: crate::labels::Labels,
+    /// The operator rulings its agent recorded (see [`crate::rulings`]),
+    /// oldest first: said again after a compaction, inherited on handoff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<crate::rulings::Ruling>,
 }
 
 /// How a live upgrade relaunches the agent sessions it took over

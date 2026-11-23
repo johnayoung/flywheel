@@ -335,6 +335,12 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn record_ruling(&self, action: crate::rulings::RulingAction) -> Result<String, String> {
+        self.hub
+            .agent_ruling(&self.session, action)
+            .map_err(|e| e.to_string())
+    }
+
     fn watch(
         &self,
         filter: &str,

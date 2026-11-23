@@ -260,6 +260,7 @@ impl Hub {
             continues: Some(from.id.clone()),
             opened_by: None,
             handoffs: Vec::new(),
+            rulings: Vec::new(),
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,

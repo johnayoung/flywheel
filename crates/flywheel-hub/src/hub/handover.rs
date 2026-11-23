@@ -47,32 +47,106 @@ impl Hub {
                  reaches you through your children watch, so end your turn to wait:"
                     .to_owned(),
             );
-            for child in children.iter().take(BRIEF_CHILDREN) {
-                let state = self
-                    .agent_status(&child.id)
-                    .map_or_else(|| "unknown".to_owned(), |s| s.state.as_str().to_owned());
-                let on = self
-                    .telemetry()
-                    .snapshot(&child.id)
-                    .and_then(|snap| snap.turn_title)
-                    .filter(|t| !t.trim().is_empty())
-                    .map(|t| {
-                        let short: String = t.chars().take(BRIEF_TITLE_CHARS).collect();
-                        format!(": {short}")
-                    })
-                    .unwrap_or_default();
-                lines.push(format!("- {} (id {}), {state}{on}", child.name, child.id));
-            }
-            if children.len() > BRIEF_CHILDREN {
-                lines.push(format!(
-                    "- and {} more (list_sessions mine: true)",
-                    children.len() - BRIEF_CHILDREN
-                ));
-            }
+            lines.extend(self.child_lines(&children));
         }
         if let Some(ask) = ask {
             lines.push(format!(
                 "{name} was waiting on the operator for: {} (their answer comes to you).",
+                ask.text
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// One line per child (name, id, state, what it is on), at most
+    /// [`BRIEF_CHILDREN`] and a count of the rest.
+    fn child_lines(&self, children: &[crate::state::SessionRecord]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for child in children.iter().take(BRIEF_CHILDREN) {
+            let state = self
+                .agent_status(&child.id)
+                .map_or_else(|| "unknown".to_owned(), |s| s.state.as_str().to_owned());
+            let on = self
+                .telemetry()
+                .snapshot(&child.id)
+                .and_then(|snap| snap.turn_title)
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| {
+                    let short: String = t.chars().take(BRIEF_TITLE_CHARS).collect();
+                    format!(": {short}")
+                })
+                .unwrap_or_default();
+            lines.push(format!("- {} (id {}), {state}{on}", child.name, child.id));
+        }
+        if children.len() > BRIEF_CHILDREN {
+            lines.push(format!(
+                "- and {} more (list_sessions mine: true)",
+                children.len() - BRIEF_CHILDREN
+            ));
+        }
+        lines
+    }
+
+    /// The agent session a report restores state to: a Claude Code
+    /// `SessionStart` whose source is `compact` (its context was just
+    /// compacted). `None` for any other report.
+    pub(crate) fn restores_on(&self, report: &crate::report::Report) -> Option<String> {
+        let compacted = report.source == crate::agent::SessionKind::Claude.as_str()
+            && report.event == "SessionStart"
+            && report
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("compact");
+        compacted.then(|| report.session.clone())
+    }
+
+    /// What the hub puts back into agent session `id`'s context after a
+    /// compaction (a `SessionStart` hook's additional context): the hub's
+    /// tools to load again, the sessions it leads, its watches, and what
+    /// it still asks the operator. Compaction keeps the task and drops how
+    /// to work; this is the state the hub owns, so it is said exactly.
+    pub(crate) fn compaction_brief(&self, id: &str) -> Option<String> {
+        self.store().session(id).ok()?;
+        let prefix = format!("mcp__{}", crate::telemetry::mcp::SERVER_NAME);
+        let mut lines = vec![
+            "--- Restored by the flywheel hub after compaction ---".to_owned(),
+            format!(
+                "Your hub tools ({}__*) may need their schemas loaded again: load the ones you \
+                 use with ToolSearch (\"select:{}__message_session,{}__watch\", ...) before \
+                 calling them.",
+                prefix, prefix, prefix
+            ),
+        ];
+        let children = self.controlled_by(id);
+        if !children.is_empty() {
+            lines.push(
+                "Sessions you lead (their reports reach you through your children watch):"
+                    .to_owned(),
+            );
+            lines.extend(self.child_lines(&children));
+        }
+        let watches = self.watches(Some(id));
+        if !watches.is_empty() {
+            lines.push("Your watches:".to_owned());
+            for watch in &watches {
+                let on = match &watch.time {
+                    Some(time) => time.words(),
+                    None => format!("on `{}`, pace {}s", watch.filter, watch.pace()),
+                };
+                lines.push(format!("- {} {on}", watch.short()));
+            }
+        }
+        if let Some(ask) = self
+            .telemetry()
+            .snapshot(id)
+            .and_then(|snap| snap.ask)
+            .filter(|ask| ask.prompt.is_none())
+        {
+            lines.push(format!(
+                "You are waiting on the operator for: {} (their answer comes as your next \
+                 prompt).",
                 ask.text
             ));
         }

@@ -305,7 +305,12 @@ impl Claude {
     /// Run the hook registered for `event` (and notification type
     /// `matcher`): check it is `fw hub report ... --stdin`, then send the
     /// report that command sends.
-    fn fire(&self, event: &str, matcher: Option<&str>, payload: Value) -> Result<(), ReportError> {
+    fn fire(
+        &self,
+        event: &str,
+        matcher: Option<&str>,
+        payload: Value,
+    ) -> Result<Option<String>, ReportError> {
         let groups = self.settings["hooks"][event]
             .as_array()
             .unwrap_or_else(|| panic!("no {event} hooks in {}", self.settings));
@@ -339,7 +344,7 @@ fn send(
     event: &str,
     detail: Option<&str>,
     payload: Option<Value>,
-) -> Result<(), ReportError> {
+) -> Result<Option<String>, ReportError> {
     report::send(
         Path::new(&env[report::SOCKET_ENV]),
         &Report {

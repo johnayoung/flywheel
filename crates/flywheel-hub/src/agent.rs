@@ -150,6 +150,17 @@ pub const CLAUDE_HOOK_TIMEOUT_SECS: u64 = 10;
 /// command hook per event instead (the same reports, one process each).
 pub const CLAUDE_HTTP_HOOKS_SINCE: (u32, u32, u32) = (2, 1, 322);
 
+/// The Claude Code release `--autocompact` was verified on: sessions get
+/// [`CLAUDE_AUTOCOMPACT_WINDOW`] once a status line has shown a CLI at or
+/// past it.
+pub const CLAUDE_AUTOCOMPACT_SINCE: (u32, u32, u32) = (2, 1, 330);
+/// The context a Claude Code session compacts at, instead of the ~967k
+/// default of a 1M window: per-call cost grows with context (measured on
+/// the hub's lead sessions; the optimum sat at 300-400k), and 400k is what
+/// the Claude Code team recommends. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in
+/// the session's environment still wins.
+pub const CLAUDE_AUTOCOMPACT_WINDOW: &str = "400k";
+
 /// The path agent hooks POST to on their hub.
 pub const HOOK_PATH: &str = "/api/telemetry/hook";
 /// The path of the hub's progress tool (an MCP server over http).
@@ -188,6 +199,8 @@ pub struct ClaudeWiring<'a> {
     /// The user's own `statusLine` setting: its command runs after the
     /// hub's, and its other fields are kept.
     pub status_line: Option<&'a serde_json::Value>,
+    /// `--autocompact` this window (a CLI that takes the flag).
+    pub autocompact: Option<&'a str>,
 }
 
 /// One hook handler: a POST to the hub when the wiring allows it for
@@ -394,6 +407,9 @@ pub fn claude_mcp_config(hub_url: &str) -> serde_json::Value {
 pub fn claude_args(session_id: &str, resume: bool, wiring: &ClaudeWiring<'_>) -> Vec<String> {
     let flag = if resume { "--resume" } else { "--session-id" };
     let mut args = vec![flag.to_owned(), session_id.to_owned()];
+    if let Some(window) = wiring.autocompact {
+        args.extend(["--autocompact".to_owned(), window.to_owned()]);
+    }
     if wiring.report.is_some_and(|r| !r.is_empty()) {
         args.push("--settings".to_owned());
         args.push(claude_settings(wiring).to_string());
@@ -1041,6 +1057,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_args_compact_at_the_window_only_when_given_one() {
+        let id = "8d2c4f8e-2f4b-4d7e-9a51-0c6f3b0a1e22";
+        let wiring = ClaudeWiring {
+            autocompact: Some(CLAUDE_AUTOCOMPACT_WINDOW),
+            ..ClaudeWiring::default()
+        };
+        assert_eq!(
+            claude_args(id, true, &wiring),
+            ["--resume", id, "--autocompact", "400k"]
+        );
+        // A CLI not known to take the flag gets none (it would refuse it).
+        let none = claude_args(id, false, &ClaudeWiring::default());
+        assert!(!none.iter().any(|a| a == "--autocompact"), "{none:?}");
+    }
+
+    #[test]
     fn claude_args_pick_session_id_or_resume() {
         let id = "8d2c4f8e-2f4b-4d7e-9a51-0c6f3b0a1e22";
         let none = ClaudeWiring::default();
@@ -1065,6 +1097,7 @@ mod tests {
             hub_url: Some("http://127.0.0.1:7420"),
             http_hooks: true,
             status_line: Some(&theirs),
+            autocompact: None,
         };
         let settings = claude_settings(&wiring);
         // No process per event: every hook but SessionStart is a POST

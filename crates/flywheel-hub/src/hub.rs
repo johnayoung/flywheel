@@ -828,7 +828,11 @@ impl Hub {
     fn report_handler(self: &Arc<Self>) -> Arc<report::Handler> {
         let weak = Arc::downgrade(self);
         Arc::new(move |report: Report| match weak.upgrade() {
-            Some(hub) => hub.handle_report(report),
+            Some(hub) => {
+                let restore = hub.restores_on(&report);
+                hub.handle_report(report)?;
+                Ok(restore.and_then(|session| hub.compaction_brief(&session)))
+            }
             None => Err("the hub is shutting down".into()),
         })
     }

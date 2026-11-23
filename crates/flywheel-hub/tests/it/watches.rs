@@ -557,3 +557,87 @@ async fn a_started_child_reports_by_its_closing_message_and_holds_its_lead() {
     }
     shown_is(&t, &lead.id, "done").await;
 }
+
+/// Send `event` for `agent` the way its hook does; what the hub hands
+/// back to the agent.
+async fn hook_context(agent: &Agent, event: &str, payload: Value) -> Option<String> {
+    let env = agent.env().await;
+    report::send(
+        Path::new(&env[report::SOCKET_ENV]),
+        &Report {
+            session: env[report::SESSION_ENV].clone(),
+            secret: env[report::SECRET_ENV].clone(),
+            source: "claude".into(),
+            event: event.into(),
+            detail: None,
+            payload: Some(payload),
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compacted_lead_gets_its_children_watches_and_ask_back() {
+    let t = TestHub::start().await;
+    let ws = t.workspace("w").await;
+    let lead = t.claude(&ws, "lead").await;
+    lead.fire("SessionStart", None).await;
+    let (status, _) = t
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/sessions/{}/start-policy", lead.id),
+            Some(json!({ "policy": "allowed" })),
+        )
+        .await;
+    assert!(status.is_success());
+    let made = t
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "claude", "name": "c1",
+                    "opened_by": lead.id, "cols": 100, "rows": 30 }),
+        )
+        .await;
+    let child = Agent {
+        id: made["id"].as_str().unwrap().to_owned(),
+        log: t.root.join("log"),
+    };
+    child.fire("SessionStart", None).await;
+    // The lead asked the operator something before its context filled.
+    lead.fire_with("UserPromptSubmit", json!({ "prompt": "lead" }))
+        .await;
+    lead.fire_with(
+        "Stop",
+        json!({ "last_assistant_message": "Ready. Should I deploy 665691e6?" }),
+    )
+    .await;
+    t.status_is(&lead.id, "done").await;
+
+    // A fresh start or a resume gets nothing: its context is whole.
+    for source in ["startup", "resume"] {
+        assert_eq!(
+            hook_context(&lead, "SessionStart", json!({ "source": source })).await,
+            None
+        );
+    }
+    // After a compaction the hub says what it owns, exactly.
+    let brief = hook_context(&lead, "SessionStart", json!({ "source": "compact" }))
+        .await
+        .expect("a compacted session gets a brief");
+    assert!(brief.contains("Restored by the flywheel hub"), "{brief}");
+    assert!(
+        brief.contains("select:mcp__flywheel__message_session"),
+        "{brief}"
+    );
+    assert!(
+        brief.contains(&format!("- c1 (id {})", child.id)),
+        "{brief}"
+    );
+    assert!(brief.contains("Your watches:\n- w"), "{brief}");
+    assert!(brief.contains("pace 300s"), "{brief}");
+    assert!(brief.contains("Should I deploy 665691e6?"), "{brief}");
+    // A worker with nothing of its own still learns to reload its tools.
+    let alone = hook_context(&child, "SessionStart", json!({ "source": "compact" }))
+        .await
+        .unwrap();
+    assert!(!alone.contains("Sessions you lead"), "{alone}");
+}

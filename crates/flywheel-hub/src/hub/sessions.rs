@@ -737,6 +737,9 @@ impl Hub {
                             hub_url: hub_url.as_deref(),
                             http_hooks,
                             status_line: theirs.status_line.as_ref(),
+                            autocompact: self
+                                .claude_version_at_least(agent::CLAUDE_AUTOCOMPACT_SINCE)
+                                .then_some(agent::CLAUDE_AUTOCOMPACT_WINDOW),
                         };
                         argv.extend(agent::claude_args(conversation, exists, &wiring));
                     }

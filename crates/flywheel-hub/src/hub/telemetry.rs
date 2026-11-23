@@ -91,11 +91,16 @@ impl Hub {
     /// [`agent::CLAUDE_HTTP_HOOKS_SINCE`]. Until one has (a hub's first
     /// session ever), hooks run the report command.
     pub(super) fn claude_takes_http_hooks(&self) -> bool {
+        self.claude_version_at_least(agent::CLAUDE_HTTP_HOOKS_SINCE)
+    }
+
+    /// Whether the Claude Code CLI last seen is `since` or later.
+    pub(super) fn claude_version_at_least(&self, since: (u32, u32, u32)) -> bool {
         self.capture
             .claude_version
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_some_and(|seen| seen >= agent::CLAUDE_HTTP_HOOKS_SINCE)
+            .is_some_and(|seen| seen >= since)
     }
 
     /// Note the CLI version a status line input names.

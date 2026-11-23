@@ -929,6 +929,7 @@ fn report_main(
     };
     let status_line = cli.args.event == crate::telemetry::claude::STATUS_LINE_EVENT;
     let chain = cli.args.chain.clone();
+    let event = cli.args.event.clone();
     let mut input = None;
     let sent = send_report(cli.args, stdin, env, &mut input);
     if status_line {
@@ -936,7 +937,15 @@ fn report_main(
         return 0;
     }
     match sent {
-        Ok(()) => 0,
+        Ok(Some(context)) => {
+            // The hook's output: Claude Code adds it to the agent's context.
+            let output = serde_json::json!({
+                "hookSpecificOutput": { "hookEventName": event, "additionalContext": context }
+            });
+            let _ = writeln!(out, "{output}");
+            0
+        }
+        Ok(None) => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub report: {message}");
             1
@@ -981,7 +990,7 @@ fn send_report(
     stdin: &mut dyn std::io::Read,
     env: &dyn ReportEnv,
     input: &mut Option<Vec<u8>>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use crate::report;
     // Read before anything can fail: a status line shows either way.
     let raw = match (&args.payload, args.stdin) {
@@ -1285,6 +1294,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_report_the_hub_answers_with_context_prints_it_as_the_hooks_output() {
+        use crate::report::{Report, ReportServer, SECRET_ENV, SESSION_ENV, SOCKET_ENV};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let server = ReportServer::bind(
+            dir.path(),
+            Arc::new(|r: Report| Ok((r.event == "SessionStart").then(|| "Restored.".to_owned()))),
+        )
+        .unwrap();
+        let env = FakeEnv(vec![
+            (SESSION_ENV, "sess".into()),
+            (SOCKET_ENV, server.path().to_string_lossy().into_owned()),
+            (SECRET_ENV, "s".into()),
+        ]);
+        let start = ["--source", "claude", "--event", "SessionStart", "--stdin"];
+        let (code, out, err) = report_out(&start, r#"{"source":"compact"}"#, &env);
+        assert_eq!(code, 0, "{err}");
+        let printed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(
+            printed["hookSpecificOutput"],
+            serde_json::json!({"hookEventName": "SessionStart", "additionalContext": "Restored."})
+        );
+        // No context: nothing on stdout.
+        let (code, _) = report_args(&["--source", "claude", "--event", "Stop"], "", &env);
+        assert_eq!(code, 0);
+    }
+
     fn report_args(args: &[&str], stdin: &str, env: &FakeEnv) -> (i32, String) {
         let (code, out, err) = report_out(args, stdin, env);
         assert_eq!(out, "", "a hook's report prints nothing to stdout");
@@ -1340,7 +1377,7 @@ mod tests {
                     return Err("bad secret".into());
                 }
                 sink.lock().unwrap().push(r);
-                Ok(())
+                Ok(None)
             }),
         )
         .unwrap();

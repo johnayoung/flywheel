@@ -74,6 +74,10 @@ pub struct Reply {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What the hook hands back to its agent (a `SessionStart` after a
+    /// compaction: what the hub restores), printed by `fw hub report`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// Report-channel failures.
@@ -91,8 +95,9 @@ pub enum ReportError {
     BadReply(String),
 }
 
-/// Handles one report; returns an error message to send back.
-pub type Handler = dyn Fn(Report) -> Result<(), String> + Send + Sync;
+/// Handles one report: context for the agent, or an error message to send
+/// back.
+pub type Handler = dyn Fn(Report) -> Result<Option<String>, String> + Send + Sync;
 
 /// The listening side: an accept thread that hands each report to the
 /// handler on a short-lived thread.
@@ -455,13 +460,15 @@ fn serve_connection(stream: UnixStream, handler: &Handler) {
         Err(e) => Err(e),
     };
     let reply = match reply {
-        Ok(()) => Reply {
+        Ok(context) => Reply {
             ok: true,
             error: None,
+            context,
         },
         Err(error) => Reply {
             ok: false,
             error: Some(error),
+            context: None,
         },
     };
     let mut stream = stream;
@@ -490,8 +497,8 @@ fn read_line(stream: &UnixStream) -> Result<Vec<u8>, String> {
 }
 
 /// Send one report to the hub listening on `socket` and wait for its
-/// answer.
-pub fn send(socket: &Path, report: &Report) -> Result<(), ReportError> {
+/// answer: the context it hands the agent, if any.
+pub fn send(socket: &Path, report: &Report) -> Result<Option<String>, ReportError> {
     let io = |source| ReportError::Io {
         path: socket.to_path_buf(),
         source,
@@ -509,7 +516,7 @@ pub fn send(socket: &Path, report: &Report) -> Result<(), ReportError> {
     let reply: Reply = serde_json::from_str(answer.trim_end())
         .map_err(|e| ReportError::BadReply(format!("{e}: {answer:?}")))?;
     if reply.ok {
-        Ok(())
+        Ok(reply.context)
     } else {
         Err(ReportError::Refused(reply.error.unwrap_or_default()))
     }
@@ -579,7 +586,7 @@ mod tests {
                     return Err("nope".into());
                 }
                 sink.lock().unwrap().push(r);
-                Ok(())
+                Ok(None)
             }),
         )
         .unwrap();
@@ -627,7 +634,7 @@ mod tests {
             dir.path(),
             Arc::new(move |r: Report| {
                 sink.lock().unwrap().push(r);
-                Ok(())
+                Ok(None)
             }),
         )
         .unwrap();
@@ -660,7 +667,7 @@ mod tests {
         );
         let long = dir.path().join("x".repeat(120));
         std::fs::create_dir_all(&long).unwrap();
-        let server = ReportServer::bind(&long, Arc::new(|_| Ok(()))).unwrap();
+        let server = ReportServer::bind(&long, Arc::new(|_| Ok(None))).unwrap();
         let path = server.path().to_path_buf();
         assert!(path.as_os_str().len() <= MAX_SOCKET_PATH, "{path:?}");
         assert!(!path.starts_with(&long));
@@ -731,7 +738,7 @@ mod tests {
             dir.path(),
             Arc::new(move |_| {
                 flag.store(true, Ordering::SeqCst);
-                Ok(())
+                Ok(None)
             }),
         )
         .unwrap();
@@ -806,7 +813,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stale = UnixListener::bind(dir.path().join(SOCKET_FILE)).unwrap();
         drop(stale); // the file stays, nothing listens
-        let server = ReportServer::bind(dir.path(), Arc::new(|_| Ok(()))).unwrap();
+        let server = ReportServer::bind(dir.path(), Arc::new(|_| Ok(None))).unwrap();
         send(server.path(), &report("Stop")).unwrap();
     }
 

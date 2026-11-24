@@ -28,8 +28,9 @@ pub(super) struct Capture {
     /// totals come from it, not from the transcript.
     status_lines: Mutex<HashSet<String>>,
     /// The Claude Code version a session's status line last showed (kept
-    /// in [`CLAUDE_VERSION_FILE`]): what decides http hooks. Never asked
-    /// of the CLI itself: the hub runs no agent program on its own.
+    /// in [`CLAUDE_VERSION_FILE`]): the fallback when the install does not
+    /// name its version. Never asked of the CLI itself: the hub runs no
+    /// agent program on its own.
     claude_version: Mutex<Option<(u32, u32, u32)>>,
     /// The capture token, once read or made (see [`super::capture`]).
     pub(super) token: Mutex<Option<String>>,
@@ -86,21 +87,20 @@ impl Hub {
             .clone()
     }
 
-    /// Whether Claude Code sessions get http hooks: a session's status
-    /// line has shown a CLI at or past
-    /// [`agent::CLAUDE_HTTP_HOOKS_SINCE`]. Until one has (a hub's first
-    /// session ever), hooks run the report command.
-    pub(super) fn claude_takes_http_hooks(&self) -> bool {
-        self.claude_version_at_least(agent::CLAUDE_HTTP_HOOKS_SINCE)
-    }
-
-    /// Whether the Claude Code CLI last seen is `since` or later.
-    pub(super) fn claude_version_at_least(&self, since: (u32, u32, u32)) -> bool {
-        self.capture
-            .claude_version
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some_and(|seen| seen >= since)
+    /// The Claude Code version a session launching `program` runs: read
+    /// from its install (see [`agent::installed_claude_version`]), else the
+    /// one a session's status line last showed. `None` until either is
+    /// known (a hub's first session ever, on an install of unknown shape).
+    pub(super) fn claude_version_of(&self, program: &str) -> Option<(u32, u32, u32)> {
+        agent::which(program)
+            .and_then(|path| agent::installed_claude_version(&path))
+            .or_else(|| {
+                *self
+                    .capture
+                    .claude_version
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            })
     }
 
     /// Note the CLI version a status line input names.

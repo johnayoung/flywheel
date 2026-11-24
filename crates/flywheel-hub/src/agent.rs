@@ -463,6 +463,24 @@ pub fn claude_user_settings(config_dir: Option<&Path>, cwd: &Path) -> ClaudeUser
     found
 }
 
+/// The version of the Claude Code CLI at `program`, read from where it is
+/// installed, never by running it: a native install's binary is
+/// `.../versions/<version>`, an npm install's script sits beside the
+/// `@anthropic-ai/claude-code` package.json. `None` for anything else.
+pub fn installed_claude_version(program: &Path) -> Option<(u32, u32, u32)> {
+    let real = std::fs::canonicalize(program).ok()?;
+    if real.parent().and_then(Path::file_name) == Some(OsStr::new("versions")) {
+        return parse_claude_version(real.file_name()?.to_str()?);
+    }
+    real.ancestors().skip(1).take(3).find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+        let package: serde_json::Value = serde_json::from_str(&text).ok()?;
+        (package.get("name")?.as_str()? == "@anthropic-ai/claude-code")
+            .then(|| parse_claude_version(package.get("version")?.as_str()?))
+            .flatten()
+    })
+}
+
 /// The `major.minor.patch` in a `claude --version` line.
 pub fn parse_claude_version(text: &str) -> Option<(u32, u32, u32)> {
     let word = text
@@ -1206,6 +1224,44 @@ mod tests {
         );
         assert_eq!(parse_claude_version("claude 2.2.0-beta.1"), Some((2, 2, 0)));
         assert_eq!(parse_claude_version("nope"), None);
+    }
+
+    #[test]
+    fn the_installed_claude_version_is_read_from_its_install_not_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("share/claude/versions/2.1.330");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, "").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&native, bin.join("claude")).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            installed_claude_version(&bin.join("claude")),
+            Some((2, 1, 330))
+        );
+        let npm = dir
+            .path()
+            .join("lib/node_modules/@anthropic-ai/claude-code");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::write(npm.join("cli.js"), "").unwrap();
+        std::fs::write(
+            npm.join("package.json"),
+            r#"{"name": "@anthropic-ai/claude-code", "version": "2.1.329"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_claude_version(&npm.join("cli.js")),
+            Some((2, 1, 329))
+        );
+        std::fs::write(
+            npm.join("package.json"),
+            r#"{"name": "other", "version": "9.9.9"}"#,
+        )
+        .unwrap();
+        assert_eq!(installed_claude_version(&npm.join("cli.js")), None);
+        assert_eq!(installed_claude_version(&dir.path().join("missing")), None);
     }
 
     #[test]

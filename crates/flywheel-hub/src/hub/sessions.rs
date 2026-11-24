@@ -731,16 +731,21 @@ impl Hub {
                             self.options.claude_config_dir.as_deref(),
                             &record.cwd,
                         );
+                        // The CLI this spawn runs: a running session on an
+                        // older one says nothing about it.
+                        let version = argv
+                            .first()
+                            .and_then(|program| self.claude_version_of(program));
+                        let takes = |since| version.is_some_and(|v| v >= since);
                         let http_hooks = hub_url.is_some()
                             && !theirs.restricts_http_hooks
-                            && self.claude_takes_http_hooks();
+                            && takes(agent::CLAUDE_HTTP_HOOKS_SINCE);
                         let wiring = agent::ClaudeWiring {
                             report,
                             hub_url: hub_url.as_deref(),
                             http_hooks,
                             status_line: theirs.status_line.as_ref(),
-                            autocompact: self
-                                .claude_version_at_least(agent::CLAUDE_AUTOCOMPACT_SINCE)
+                            autocompact: takes(agent::CLAUDE_AUTOCOMPACT_SINCE)
                                 .then_some(agent::CLAUDE_AUTOCOMPACT_WINDOW),
                         };
                         argv.extend(agent::claude_args(conversation, exists, &wiring));

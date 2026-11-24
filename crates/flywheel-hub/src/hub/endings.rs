@@ -1293,6 +1293,7 @@ impl Hub {
             .filter(|p| !inside.contains(&p.pid))
             .map(|p| (p.pid, p.command.clone()))
             .collect();
+        self.note_ending(id, &Actor::Operator);
         self.kill_session(id)?;
         hang_up_outside(outside);
         let end = EndRecord {
@@ -1495,6 +1496,7 @@ impl Hub {
                     .map(|p| (p.pid, p.command.clone()))
                     .collect();
                 let end = self.record_end(&fresh, &ending, killed, dirty);
+                self.note_ending(&fresh.id, &ending.by);
                 if let Err(e) = self.kill_session(&fresh.id) {
                     eprintln!("fw hub: session {}: ending: {e}", fresh.id);
                 }

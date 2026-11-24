@@ -32,6 +32,10 @@ pub(super) struct Capture {
     /// name its version. Never asked of the CLI itself: the hub runs no
     /// agent program on its own.
     claude_version: Mutex<Option<(u32, u32, u32)>>,
+    /// Who is ending each session whose process the hub is about to stop
+    /// (a session's id, or `operator`): noted before the kill, so its exit
+    /// says who even when its record is removed before the exit lands.
+    ended_by: Mutex<std::collections::HashMap<String, String>>,
     /// The capture token, once read or made (see [`super::capture`]).
     pub(super) token: Mutex<Option<String>>,
 }
@@ -290,6 +294,24 @@ impl Hub {
             ));
         }
         self.telemetry.record(&record.id, drafts);
+    }
+
+    /// Note that `by` is ending session `id` (see [`Capture::ended_by`]).
+    pub(super) fn note_ending(&self, id: &str, by: &crate::state::Actor) {
+        self.capture
+            .ended_by
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned(), by.tag());
+    }
+
+    /// Who ended session `id`, as noted before its process was stopped.
+    pub(super) fn take_ending(&self, id: &str) -> Option<String> {
+        self.capture
+            .ended_by
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
     }
 
     /// The session's process exited: its telemetry ends (when the agent

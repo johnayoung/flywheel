@@ -251,6 +251,7 @@ impl Hub {
                     StateError::Conflict(format!("{} is not at rest ({why})", fresh.name))
                 })?;
             }
+            self.note_ending(id, &crate::state::Actor::Operator);
             self.kill_session(id)?;
             drop(turn);
         }

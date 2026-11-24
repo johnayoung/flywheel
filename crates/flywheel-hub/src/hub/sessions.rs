@@ -918,6 +918,7 @@ impl Hub {
         // Its watches end with it, unless the hub hung it up (a stop, a
         // relaunch after an upgrade): it comes back as itself.
         let stopping = self.activity().is_stopping();
+        let noted = self.take_ending(id);
         let (relaunching, by) = self.store().session(id).map_or((false, None), |r| {
             let by = r
                 .ending
@@ -926,6 +927,7 @@ impl Hub {
                 .or_else(|| r.ended.as_ref().map(|e| e.by.tag()));
             (r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()), by)
         });
+        let by = noted.or(by);
         let _ = self.store().mark_exited(id, exit);
         if !stopping && !relaunching {
             // Its children pass to its successor (or up its chain) now that

@@ -3228,6 +3228,20 @@ async fn a_worker_that_dies_wakes_its_lead_and_one_it_ended_does_not() {
     sleep(Duration::from_secs(4)).await;
     let typed = lead.typed();
     assert_eq!(typed.matches("session.finished").count(), 1, "{typed}");
+    // Its exit says who ended it, even with its record removed first.
+    let log = hub.get("/api/log?limit=1000").await;
+    let finished: Vec<&Value> = log["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["session"] == ended.id.as_str()
+                && e["kind"] == "session.finished"
+                && e["body"]["reason"] == "exited"
+        })
+        .collect();
+    assert_eq!(finished.len(), 1, "{log}");
+    assert_eq!(finished[0]["body"]["by"], lead.id.as_str(), "{log}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

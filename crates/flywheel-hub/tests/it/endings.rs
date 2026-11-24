@@ -649,7 +649,8 @@ async fn senders_see_and_cancel_only_their_own_messages_and_priority_goes_first(
     let lead = hub.claude("lead", None, json!({})).await;
     hub.policy(&lead, "allowed").await;
     let other = hub.claude("other", Some(&lead), json!({})).await;
-    let worker = hub.claude("worker", Some(&lead), json!({})).await;
+    // Not the lead's: its messages wait for the turn like the others.
+    let worker = hub.claude("worker", None, json!({})).await;
     for agent in [&lead, &other, &worker] {
         agent.turn().await;
     }
@@ -764,7 +765,8 @@ async fn a_newer_message_on_a_topic_supersedes_the_older_one() {
     let lead = hub.claude("lead", None, json!({})).await;
     hub.policy(&lead, "allowed").await;
     let other = hub.claude("other", Some(&lead), json!({})).await;
-    let worker = hub.claude("worker", Some(&lead), json!({})).await;
+    // Not the lead's: its messages wait for the turn like the others.
+    let worker = hub.claude("worker", None, json!({})).await;
     for agent in [&lead, &other, &worker] {
         agent.turn().await;
     }
@@ -2550,10 +2552,12 @@ async fn an_end_survives_a_restart_and_one_that_never_settles_is_called_off() {
     let lead = hub.claude("lead", None, json!({})).await;
     hub.policy(&lead, "allowed").await;
     let old = hub.claude("old", Some(&lead), json!({})).await;
+    let peer = hub.claude("peer", None, json!({})).await;
     lead.turn().await;
+    peer.turn().await;
     old.hook("UserPromptSubmit", json!({"prompt": "long work"}))
         .await;
-    lead.ok(
+    peer.ok(
         "message_session",
         json!({"to": "old", "text": "queued before"}),
     )
@@ -3256,12 +3260,13 @@ async fn a_workers_status_shows_its_branch_tip_and_what_it_has_not_read() {
     let lead = hub.claude("lead", None, json!({})).await;
     hub.policy(&lead, "allowed").await;
     let kid = hub.claude("kid", Some(&lead), json!({})).await;
-    for agent in [&lead, &kid] {
+    let peer = hub.claude("peer", None, json!({})).await;
+    for agent in [&lead, &kid, &peer] {
         agent.turn().await;
     }
     kid.hook("UserPromptSubmit", json!({"prompt": "work"}))
         .await;
-    lead.ok(
+    peer.ok(
         "message_session",
         json!({"to": "kid", "text": "Rebase first."}),
     )
@@ -3270,7 +3275,7 @@ async fn a_workers_status_shows_its_branch_tip_and_what_it_has_not_read() {
     assert!(status.contains("\ntip: main at "), "{status}");
     assert!(status.contains(" fix the bench"), "{status}");
     assert!(
-        status.contains("unread: 1 queued message (oldest ") && status.contains("from lead)"),
+        status.contains("unread: 1 queued message (oldest ") && status.contains("from peer)"),
         "{status}"
     );
     kid.hook("Stop", json!({})).await;
@@ -3326,4 +3331,78 @@ async fn an_agent_rewrites_its_own_watch_prompt_and_no_one_elses() {
         .tool("watch", json!({"id": id, "prompt": "x", "every": "1h"}))
         .await;
     assert!(refused && why.contains("give only prompt"), "{why}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leads_message_goes_into_its_workers_running_turn_and_a_peers_waits() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let kid = hub.claude("kid", Some(&lead), json!({})).await;
+    let peer = hub.claude("peer", None, json!({})).await;
+    for agent in [&lead, &kid, &peer] {
+        agent.turn().await;
+    }
+    kid.hook("UserPromptSubmit", json!({"prompt": "work"}))
+        .await;
+    // Its lead's message: typed in with Enter while the turn runs (Claude
+    // Code reads it at the turn's next tool call).
+    let said = lead
+        .ok(
+            "message_session",
+            json!({"to": "kid", "text": "Rebase first."}),
+        )
+        .await;
+    assert!(said.contains("Delivered to kid mid-turn"), "{said}");
+    kid.typed_has("Rebase first.").await;
+    // The next waits until the agent took that one in.
+    let said = lead
+        .ok(
+            "message_session",
+            json!({"to": "kid", "text": "Then run the tests."}),
+        )
+        .await;
+    assert!(said.contains("mid-turn if it is still working"), "{said}");
+    let said = peer
+        .ok(
+            "message_session",
+            json!({"to": "kid", "text": "FYI the bench moved."}),
+        )
+        .await;
+    assert!(said.contains("when its turn is done"), "{said}");
+    sleep(Duration::from_millis(400)).await;
+    assert!(
+        !kid.typed().contains("Then run the tests."),
+        "{}",
+        kid.typed()
+    );
+    kid.hook("UserPromptSubmit", json!({"prompt": "Rebase first."}))
+        .await;
+    kid.typed_has("Then run the tests.").await;
+    assert!(!kid.typed().contains('\u{18}'), "Enter, not send-now");
+    kid.hook("UserPromptSubmit", json!({"prompt": "Then run the tests."}))
+        .await;
+    // A priority message on a CLI with send-now: Ctrl-X Ctrl-S, ahead of
+    // the peer's plain one, which still waits for the turn.
+    kid.hook("statusline", json!({"version": "2.1.330"})).await;
+    peer.ok(
+        "message_session",
+        json!({"to": "kid", "text": "Stop: main is broken.", "priority": true}),
+    )
+    .await;
+    kid.typed_has("Stop: main is broken.").await;
+    kid.typed_has("\u{18}\u{13}").await;
+    sleep(Duration::from_millis(400)).await;
+    assert!(
+        !kid.typed().contains("FYI the bench moved."),
+        "{}",
+        kid.typed()
+    );
+    kid.hook(
+        "UserPromptSubmit",
+        json!({"prompt": "Stop: main is broken."}),
+    )
+    .await;
+    kid.hook("Stop", json!({})).await;
+    kid.typed_has("FYI the bench moved.").await;
 }

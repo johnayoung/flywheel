@@ -150,6 +150,11 @@ pub const CLAUDE_HOOK_TIMEOUT_SECS: u64 = 10;
 /// command hook per event instead (the same reports, one process each).
 pub const CLAUDE_HTTP_HOOKS_SINCE: (u32, u32, u32) = (2, 1, 322);
 
+/// The Claude Code release whose `chat:sendNow` (Ctrl-X Ctrl-S) reads a
+/// message into a running turn without cancelling it (a running shell or
+/// subagent goes to the background); before it, it interrupts the turn.
+pub const CLAUDE_SEND_NOW_SINCE: (u32, u32, u32) = (2, 1, 281);
+
 /// The Claude Code release `--autocompact` was verified on: sessions get
 /// [`CLAUDE_AUTOCOMPACT_WINDOW`] once a status line has shown a CLI at or
 /// past it.

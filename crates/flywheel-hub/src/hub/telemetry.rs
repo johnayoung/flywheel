@@ -91,11 +91,54 @@ impl Hub {
             .clone()
     }
 
+    /// How session `record`'s agent takes a message into a running turn
+    /// (see [`crate::queue::Steering`]); `None`: it does not
+    /// (a shell, or a session restored as one). Claude Code: its lead's
+    /// message with Enter (read at the turn's next tool call), a priority
+    /// one with `chat:sendNow` once the CLI has it (else after the turn);
+    /// a Haiku model, which distrusts what Enter brings in (it arrives
+    /// inside a tool result), gets `chat:sendNow` for both or neither.
+    /// Codex: Enter steers the turn. None while it is ending.
+    pub(crate) fn steering(
+        &self,
+        record: &SessionRecord,
+        model: Option<&str>,
+    ) -> Option<crate::queue::Steering> {
+        use crate::queue::{Steering, Submit};
+        // An ending session's final prompt waits for its turn to end.
+        if record.fallback_command.is_some() || record.ending.is_some() {
+            return None;
+        }
+        let lead = {
+            let store = self.store();
+            super::endings::effective_parent(record, store.sessions())
+        };
+        let (plain, urgent) = match record.kind {
+            SessionKind::Codex => (Some(Submit::Enter), Some(Submit::Enter)),
+            SessionKind::Claude => {
+                let send_now = record
+                    .command
+                    .first()
+                    .and_then(|program| self.claude_version_of(program))
+                    .is_some_and(|v| v >= agent::CLAUDE_SEND_NOW_SINCE)
+                    .then_some(Submit::SendNow);
+                let haiku = model.is_some_and(|m| m.to_ascii_lowercase().contains("haiku"));
+                (if haiku { send_now } else { Some(Submit::Enter) }, send_now)
+            }
+            SessionKind::Shell => return None,
+        };
+        Some(Steering {
+            lead,
+            plain,
+            urgent,
+        })
+    }
+
     /// The Claude Code version a session launching `program` runs: read
     /// from its install (see [`agent::installed_claude_version`]), else the
     /// one a session's status line last showed. `None` until either is
     /// known (a hub's first session ever, on an install of unknown shape).
-    pub(super) fn claude_version_of(&self, program: &str) -> Option<(u32, u32, u32)> {
+    pub(crate) fn claude_version_of(&self, program: &str) -> Option<(u32, u32, u32)> {
         agent::which(program)
             .and_then(|path| agent::installed_claude_version(&path))
             .or_else(|| {

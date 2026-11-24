@@ -1,12 +1,13 @@
 //! Delivery: reconcile what a dead hub left `sending`, the tick, stalls
 //! and the paste itself.
 
-use super::deciding::{Decision, decide, event_item, normalized};
+use super::deciding::{Decision, Submit, decide, event_item, mid_turn_key, normalized, taken_up};
 use super::runtime::Delivering;
 use super::{ItemState, RECONCILE_SKEW, SessionQueue, Stall, TICK};
 use crate::agentlog::{self, Event, Role};
 use crate::hub::Hub;
 use crate::state::SessionRecord;
+use crate::status::AgentStatus;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -99,6 +100,7 @@ impl Hub {
                 }
                 if found && queue.last_delivered_at.is_none_or(|t| t < sending_at) {
                     queue.last_delivered_at = Some(sending_at);
+                    queue.mid_turn = false;
                 }
                 queue.settle_order();
             });
@@ -187,7 +189,7 @@ impl Hub {
             let resting = facts
                 .status
                 .as_ref()
-                .is_some_and(|s| queue.last_delivered_at.is_some_and(|last| s.since <= last));
+                .is_some_and(|s| !taken_up(&queue, &facts, s));
             any |= resting;
             let Some(item) = super::deciding::unacked(&queue, &facts) else {
                 continue;
@@ -210,6 +212,7 @@ impl Hub {
                         }
                         q.resent = Some(id.clone());
                         q.last_delivered_at = None;
+                        q.mid_turn = false;
                         q.settle_order();
                     });
                     match saved {
@@ -332,9 +335,23 @@ impl Hub {
         let Some((queue, record)) = fresh else {
             return;
         };
-        if decide(&queue, &self.queue_facts(&record, &queue)) != Decision::Deliver(item_id.into()) {
+        let facts = self.queue_facts(&record, &queue);
+        if decide(&queue, &facts) != Decision::Deliver(item_id.into()) {
             return;
         }
+        // Into a running turn with its harness's key, else Enter at rest.
+        let mid_turn = facts
+            .status
+            .as_ref()
+            .is_some_and(|s| s.status == AgentStatus::Working);
+        let submit = if mid_turn {
+            match queue.head().and_then(|h| mid_turn_key(h, &facts)) {
+                Some(key) => key,
+                None => return,
+            }
+        } else {
+            Submit::Enter
+        };
         let now = Utc::now();
         let claimed = self.store().update_queue(id, |queue| {
             if queue.paused || queue.stalled.is_some() {
@@ -355,7 +372,7 @@ impl Hub {
                 return;
             }
         };
-        let pasted = self.paste_turn_held(id, &item.text, true, false);
+        let pasted = self.paste_submit(id, &item.text, Some(submit), false);
         let delivered_at = Utc::now();
         match pasted {
             Ok(_) => {
@@ -374,7 +391,10 @@ impl Hub {
                     if let Some((from, topic)) = topic {
                         queue.note_topic(from.as_deref(), &topic, Some(item_id), delivered_at);
                     }
-                    queue.last_delivered_at = Some(delivered_at);
+                    // Mid-turn, its ack (a prompt taken in) may come
+                    // before the paste returns: counted from its start.
+                    queue.last_delivered_at = Some(if mid_turn { now } else { delivered_at });
+                    queue.mid_turn = mid_turn;
                     queue.settle_order();
                     queue.trim_history();
                     queue.pending_count()
@@ -391,10 +411,15 @@ impl Hub {
                 // returns).
                 self.final_prompt_sent(id, item_id, now);
                 eprintln!(
-                    "fw hub: queue {id}: delivered {} ({} bytes, {}); {pending} pending",
+                    "fw hub: queue {id}: delivered {} ({} bytes, {}{}); {pending} pending",
                     &item_id[..item_id.len().min(8)],
                     item.text.len(),
-                    item.when.as_str()
+                    item.when.as_str(),
+                    match (mid_turn, submit) {
+                        (false, _) => "",
+                        (true, Submit::Enter) => ", into its running turn",
+                        (true, Submit::SendNow) => ", into its running turn (send now)",
+                    }
                 );
                 self.queue_changed();
                 if let Some(session) = self.event_session(id) {
@@ -404,6 +429,7 @@ impl Hub {
                             "session": session,
                             "item": event_item(&item, Some(delivered_at)),
                             "pending": pending,
+                            "mid_turn": mid_turn,
                         }),
                     );
                 }

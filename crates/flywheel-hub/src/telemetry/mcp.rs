@@ -422,7 +422,8 @@ fn message_tool() -> Value {
         "title": "Message another agent session",
         "description": "Send a message to another agent session on this hub (by name or id from \
                         list_sessions): it arrives as that agent's next prompt, under a line \
-                        naming you, now if it is idle or once its current turn is done. For \
+                        naming you, now if it is idle or once its current turn is done; a session \
+                        you started reads yours during its turn, at its next step. For \
                         coordinating shared work: a heads-up, a result it needs, a request. Do \
                         not send your final report to the session that started you: your \
                         closing message reaches it. Do not use it to reach the operator (ask_operator does that). Give a \
@@ -437,7 +438,7 @@ fn message_tool() -> Value {
                 "text": { "type": "string", "description": "The message." },
                 "priority": {
                     "type": "boolean",
-                    "description": "Optional: true queues it ahead of the other messages waiting for that session (behind earlier priority ones); it still waits for the current turn to end. Default false."
+                    "description": "Optional: true queues it ahead of the other messages waiting for that session (behind earlier priority ones); it goes into the session's running turn (Claude Code: send now, which may cut its reply short), so keep it for what cannot wait. Default false."
                 },
                 "topic": {
                     "type": "string",

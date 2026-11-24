@@ -1,4 +1,6 @@
-use super::deciding::{Decision, Facts, Presence, decide, normalized};
+use super::deciding::{
+    Decision, Facts, Presence, Steering, Submit, decide, mid_turn_key, normalized, unacked,
+};
 use super::runtime::Draft;
 use super::*;
 use crate::status::{AgentStatus, StatusView};
@@ -54,6 +56,8 @@ fn facts(status_now: Option<StatusView>) -> Facts {
         quiet: Duration::from_secs(8),
         ack: ACK_TIMEOUT,
         owner: None,
+        steering: None,
+        prompted: None,
     }
 }
 
@@ -645,4 +649,118 @@ fn only_a_plain_unread_message_from_the_same_sender_is_joined() {
         big.join_unread("lead", "From s in r: m\n\nmore than ten bytes"),
         None
     );
+}
+
+/// Facts for an agent working since `since` whose lead is `lead`, Claude
+/// Code's keys: Enter for its lead, send-now for priority.
+fn working(since: i64) -> Facts {
+    Facts {
+        steering: Some(Steering {
+            lead: Some("lead".into()),
+            plain: Some(Submit::Enter),
+            urgent: Some(Submit::SendNow),
+        }),
+        ..facts(status(AgentStatus::Working, since))
+    }
+}
+
+fn sent_by(id: &str, sender: Option<&str>, priority: bool) -> QueueItem {
+    QueueItem {
+        from: sender.map(str::to_owned),
+        priority,
+        ..item(id, When::Done)
+    }
+}
+
+#[test]
+fn its_leads_message_and_a_priority_one_go_into_a_running_turn() {
+    let lead = sent_by("a1", Some("lead"), false);
+    let f = working(10);
+    assert_eq!(
+        decide(&queue(vec![lead.clone()]), &f),
+        Decision::Deliver("a1".into())
+    );
+    assert_eq!(mid_turn_key(&lead, &f), Some(Submit::Enter));
+    let urgent = sent_by("b2", Some("peer"), true);
+    assert_eq!(
+        decide(&queue(vec![urgent.clone()]), &f),
+        Decision::Deliver("b2".into())
+    );
+    assert_eq!(mid_turn_key(&urgent, &f), Some(Submit::SendNow));
+    // A peer's plain message, the operator's prompt, and a watch's wake
+    // wait for the turn to finish.
+    let watch = QueueItem {
+        watch: Some("w1".into()),
+        ..sent_by("d4", Some("lead"), false)
+    };
+    for other in [
+        sent_by("c3", Some("peer"), false),
+        sent_by("e5", None, true),
+        watch,
+        QueueItem {
+            when: When::Idle,
+            ..sent_by("f6", Some("lead"), false)
+        },
+    ] {
+        waits(&decide(&queue(vec![other]), &f), "working");
+    }
+    // An agent that takes nothing mid-turn (a Haiku model on a CLI without
+    // send-now): after its turn.
+    let none = Facts {
+        steering: Some(Steering {
+            lead: Some("lead".into()),
+            plain: None,
+            urgent: None,
+        }),
+        ..working(10)
+    };
+    waits(&decide(&queue(vec![lead]), &none), "working");
+}
+
+#[test]
+fn never_into_a_turn_while_compacting_or_someone_types() {
+    let q = queue(vec![sent_by("a1", Some("lead"), false)]);
+    let mut compacting = working(10);
+    if let Some(s) = compacting.status.as_mut() {
+        s.state = crate::status::State::Compacting;
+    }
+    waits(&decide(&q, &compacting), "compacting");
+    let typing = Facts {
+        typed_ago: Some(Duration::from_secs(1)),
+        ..working(10)
+    };
+    waits(&decide(&q, &typing), "typed");
+    let draft = Facts {
+        draft: 3,
+        ..working(10)
+    };
+    waits(&decide(&q, &draft), "never sent");
+    let held = Facts {
+        owner: Some("a review".into()),
+        ..working(10)
+    };
+    waits(&decide(&q, &held), "a review");
+}
+
+#[test]
+fn a_message_sent_into_a_turn_is_taken_up_when_the_agent_takes_a_prompt_in() {
+    let mut q = queue(vec![sent_by("b2", Some("lead"), false)]);
+    q.last_delivered_at = Some(at(15));
+    q.mid_turn = true;
+    // Working since before it, no prompt taken in since: the next waits.
+    waits(&decide(&q, &working(10)), "take up");
+    let taken = Facts {
+        prompted: Some(at(16)),
+        ..working(10)
+    };
+    assert_eq!(decide(&q, &taken), Decision::Deliver("b2".into()));
+    // Its turn ended without taking it in: not taken up, whatever the
+    // status did; past the ack timeout it is the lost one.
+    let mut rest = facts(status(AgentStatus::Done, 18));
+    waits(&decide(&q, &rest), "take up");
+    rest.now = at(15) + chrono::Duration::from_std(ACK_TIMEOUT).unwrap();
+    assert!(unacked(&q, &rest).is_some());
+    rest.prompted = Some(at(17));
+    assert_eq!(unacked(&q, &rest), None);
+    assert_eq!(decide(&q, &rest), Decision::Deliver("b2".into()));
 }

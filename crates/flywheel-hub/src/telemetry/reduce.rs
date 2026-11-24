@@ -289,6 +289,10 @@ pub struct SessionState {
     /// When a compaction under way began (its `pre` seen, no `post` yet).
     #[serde(default)]
     compacting: Option<i64>,
+    /// When it last took a prompt in (its own turn's, or one typed while
+    /// a turn ran).
+    #[serde(default)]
+    prompted: Option<i64>,
     #[serde(default)]
     subagents: u32,
     /// The main agent's last finished call in the running turn (what it
@@ -430,6 +434,10 @@ pub struct Snapshot {
     /// its status still reads as finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<i64>,
+    /// When it last took a prompt in: a turn's, or one sent into a
+    /// running turn (the hub's ack of a message delivered mid-turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompted: Option<i64>,
     /// Its labels (`fw.state` is the status above, never stored).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: crate::labels::Labels,
@@ -617,6 +625,7 @@ impl SessionState {
             }
             What::TurnStarted { title, relayed } => {
                 self.close_wait(ts);
+                self.prompted = Some(self.prompted.map_or(ts, |at| at.max(ts)));
                 self.ended = false;
                 // The prompt's text arriving after its turn began (Codex
                 // writes the two apart) titles that turn.
@@ -1465,6 +1474,7 @@ impl SessionState {
             awaiting_ms: self.awaiting_ms,
             compactions: self.compactions,
             compacting: self.compacting,
+            prompted: self.prompted,
             labels: self.labels.clone(),
         }
     }

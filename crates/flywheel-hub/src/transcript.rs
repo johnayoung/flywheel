@@ -1564,6 +1564,20 @@ impl Hub {
         run: bool,
         typing: bool,
     ) -> Result<PasteOutcome, HubError> {
+        let submit = run.then_some(crate::queue::Submit::Enter);
+        self.paste_submit(id, text, submit, typing)
+    }
+
+    /// [`Hub::paste_turn_held`] submitted with `submit` (`None`: typed in,
+    /// not sent).
+    pub(crate) fn paste_submit(
+        &self,
+        id: &str,
+        text: &str,
+        submit: Option<crate::queue::Submit>,
+        typing: bool,
+    ) -> Result<PasteOutcome, HubError> {
+        let run = submit.is_some();
         let record = self.session(id)?.record;
         check_paste(text)?;
         let session = self
@@ -1585,18 +1599,21 @@ impl Hub {
         let bytes = paste_bytes(text.trim_end_matches(['\n', '\r']), bracketed);
         if typing {
             self.note_typing(id, &bytes);
-            if run {
-                self.note_typing(id, b"\r");
+            if let Some(key) = submit {
+                self.note_typing(id, key.bytes());
             }
         }
         let mut len = bytes.len();
         let mut outcome = session.write(bytes);
-        if run && outcome == WriteOutcome::Queued {
-            // Enter as its own keypress, as `fw hub send` does (a TUI
-            // takes one fast burst as part of the paste).
+        if let Some(key) = submit
+            && outcome == WriteOutcome::Queued
+        {
+            // The key as its own keypress, as `fw hub send` does (a TUI
+            // takes one fast burst as part of the paste); a chord's keys
+            // in one write.
             std::thread::sleep(ENTER_DELAY);
-            outcome = session.write(b"\r".to_vec());
-            len += 1;
+            outcome = session.write(key.bytes().to_vec());
+            len += key.bytes().len();
         }
         if run && outcome == WriteOutcome::Queued {
             self.nudge_badge_soon(&record);

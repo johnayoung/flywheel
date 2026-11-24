@@ -1,7 +1,7 @@
 //! The hub's queue calls: typing and holds, views, and the edits the API
 //! and CLI make.
 
-use super::deciding::{Decision, Facts, Presence, decide, exit_text};
+use super::deciding::{Decision, Facts, Presence, decide, exit_text, mid_turn_key};
 use super::input_line::unsent_on_screen;
 use super::runtime::{SessionHold, lock};
 use super::{
@@ -207,20 +207,40 @@ impl Hub {
             self.grading_owns(&record.id)
                 .then(|| "a fan-out grading".to_owned())
         });
+        let status = if record.runs_agent() {
+            self.agent_status(&record.id)
+        } else {
+            None
+        };
+        // What telemetry knows of its prompts: read only when a delivery
+        // waits on it, or a message could go into a running turn.
+        let working = status
+            .as_ref()
+            .is_some_and(|s| s.status == AgentStatus::Working);
+        let from_agent = queue.head().is_some_and(|h| h.from.is_some());
+        let snap = (status.is_some() && (queue.last_delivered_at.is_some() || working))
+            .then(|| self.telemetry().snapshot(&record.id))
+            .flatten();
+        let prompted = snap
+            .as_ref()
+            .and_then(|s| s.prompted)
+            .and_then(chrono::DateTime::from_timestamp_millis);
+        let steering = snap
+            .as_ref()
+            .filter(|_| working && from_agent)
+            .and_then(|s| self.steering(record, s.model.as_deref()));
         Facts {
             now: Utc::now(),
             presence: self.presence(record),
-            status: if record.runs_agent() {
-                self.agent_status(&record.id)
-            } else {
-                None
-            },
+            status,
             typed_ago: runtime.typed_ago(&record.id),
             draft: self.unsent_input(record),
             editing: queue.head().is_some_and(|h| runtime.is_editing(&h.id)),
             quiet: self.tunables().queue_typing_quiet,
             ack: self.options.queue_ack_timeout,
             owner,
+            steering,
+            prompted,
         }
     }
 
@@ -606,6 +626,8 @@ pub enum Delivery {
     /// Typed in now (bracketed paste, then Enter).
     Pasted {
         paste: crate::transcript::PasteOutcome,
+        /// Into the agent's running turn (see [`super::deciding::mid_turn_key`]).
+        mid_turn: bool,
     },
     /// Queued: the agent is busy (or prompts are queued before it); it
     /// goes once the queue's rules let it.
@@ -753,6 +775,7 @@ impl Hub {
         let current = self.store().queue(id).cloned().unwrap_or_default();
         let mut alone = SessionQueue {
             last_delivered_at: current.last_delivered_at,
+            mid_turn: current.mid_turn,
             ..SessionQueue::default()
         };
         alone.items.push(QueueItem {
@@ -800,7 +823,16 @@ impl Hub {
             None => {
                 // Taken before the paste: the turn it starts reports after.
                 let at = Utc::now();
-                let paste = self.paste_turn_held(id, &text, true, false)?;
+                let mid_turn = facts
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.status == AgentStatus::Working);
+                let submit = if mid_turn {
+                    mid_turn_key(&alone.items[0], &facts).unwrap_or(super::Submit::Enter)
+                } else {
+                    super::Submit::Enter
+                };
+                let paste = self.paste_submit(id, &text, Some(submit), false)?;
                 // Kept in memory even when the save fails: the paste went.
                 // On record as delivered, so a paste the agent never takes
                 // up is sent again (see the queue's ack tick).
@@ -813,8 +845,10 @@ impl Hub {
                     queue.items.push(item);
                     queue.settle_order();
                     queue.trim_history();
-                    queue.last_delivered_at =
-                        Some(queue.last_delivered_at.map_or(at, |t| t.max(at)));
+                    if queue.last_delivered_at.is_none_or(|t| t <= at) {
+                        queue.last_delivered_at = Some(at);
+                        queue.mid_turn = mid_turn;
+                    }
                     if let Some(topic) = topic {
                         queue.note_topic(from, topic, None, at);
                     }
@@ -822,7 +856,7 @@ impl Hub {
                     eprintln!("fw hub: queue {id}: sent, but not recorded: {e}");
                 }
                 self.queue_changed();
-                Ok(Delivery::Pasted { paste })
+                Ok(Delivery::Pasted { paste, mid_turn })
             }
             Some(why) => {
                 // An agent's plain message joins its own unread one: one

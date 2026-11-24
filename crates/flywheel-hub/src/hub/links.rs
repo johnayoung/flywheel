@@ -378,6 +378,12 @@ impl Hub {
             "a message from that agent session",
         );
         let topic = topic.map(str::trim).filter(|t| !t.is_empty());
+        // Its lead's message, or a priority one, goes into a running turn.
+        let steers = priority || {
+            let store = self.store();
+            super::endings::effective_parent(&target, store.sessions()).as_deref()
+                == Some(sender.id.as_str())
+        };
         let (delivery, superseded) = self.send_or_queue_topic(
             &target.id,
             &from_line,
@@ -401,7 +407,17 @@ impl Hub {
             _ => String::new(),
         };
         let after_read = format!("{after_read}{redirected}");
+        let when = if steers {
+            "as soon as it can, mid-turn if it is still working"
+        } else {
+            "when its turn is done"
+        };
         Ok(match delivery {
+            Delivery::Pasted { mid_turn: true, .. } => format!(
+                "Delivered to {} mid-turn: it reads it at its next step, without stopping its \
+                 work.{after_read}",
+                target.name
+            ),
             Delivery::Pasted { .. } => {
                 format!("Delivered to {}: it reads it now.{after_read}", target.name)
             }
@@ -413,12 +429,12 @@ impl Hub {
                     .map_or(1, |at| at + 1);
                 format!(
                     "Queued for {} as priority (id {item}, #{place} in its queue): it reads it \
-                         when its turn is done.{after_read}",
+                         {when}.{after_read}",
                     target.name
                 )
             }
             Delivery::Queued { why, .. } => format!(
-                "Queued for {} ({why}): it reads it when its turn is done.{after_read}",
+                "Queued for {} ({why}): it reads it {when}.{after_read}",
                 target.name
             ),
         })

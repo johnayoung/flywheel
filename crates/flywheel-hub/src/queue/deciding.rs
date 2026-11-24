@@ -5,7 +5,7 @@
 use super::ACK_TIMEOUT;
 use super::{EVENT_TEXT_CHARS, ItemState, QueueItem, SETTLE, SessionQueue, When};
 use crate::pty::ExitInfo;
-use crate::status::{AgentStatus, StatusView};
+use crate::status::{AgentStatus, State, StatusView};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -40,6 +40,73 @@ pub(crate) struct Facts {
     pub ack: Duration,
     /// What holds it now (a review action, a fan-out grading).
     pub owner: Option<String>,
+    /// How its agent takes a message into a running turn (`None`: it
+    /// does not, or it is not working).
+    pub steering: Option<Steering>,
+    /// When its agent last took a prompt in, a turn's or one sent into a
+    /// running turn (`None`: not known).
+    pub prompted: Option<DateTime<Utc>>,
+}
+
+/// The key that submits a pasted prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Submit {
+    /// Enter: at rest, a turn; mid-turn, Claude Code reads it at the
+    /// turn's next tool call, and Codex steers the turn with it.
+    Enter,
+    /// Claude Code's `chat:sendNow` (Ctrl-X Ctrl-S): read now, as the
+    /// operator's own message (a running shell or subagent goes to the
+    /// background; a reply being written is cut short).
+    SendNow,
+}
+
+impl Submit {
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Enter => b"\r",
+            Self::SendNow => b"\x18\x13",
+        }
+    }
+}
+
+/// How a working agent takes a message into its running turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Steering {
+    /// Its lead: the session whose messages go in mid-turn.
+    pub lead: Option<String>,
+    /// The key for its lead's message (`None`: after the turn only).
+    pub plain: Option<Submit>,
+    /// The key for a priority message from any agent.
+    pub urgent: Option<Submit>,
+}
+
+/// How `item` goes into its agent's running turn, when it does: an
+/// agent's message, from the session's lead or marked priority, while
+/// the agent can take one. The operator's prompts, watches, and the
+/// rest wait for the turn to finish.
+pub(crate) fn mid_turn_key(item: &QueueItem, facts: &Facts) -> Option<Submit> {
+    let steering = facts.steering.as_ref()?;
+    if item.when != When::Done || item.watch.is_some() {
+        return None;
+    }
+    let from = item.from.as_deref()?;
+    if item.priority {
+        steering.urgent
+    } else if steering.lead.as_deref() == Some(from) {
+        steering.plain
+    } else {
+        None
+    }
+}
+
+/// Whether the agent took up the last delivered prompt: a turn began
+/// after it, or (one sent into a running turn, whose status need not
+/// move) it took a prompt in after it.
+pub(super) fn taken_up(queue: &SessionQueue, facts: &Facts, status: &StatusView) -> bool {
+    let Some(last) = queue.last_delivered_at else {
+        return true;
+    };
+    facts.prompted.is_some_and(|at| at >= last) || (!queue.mid_turn && status.since > last)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,12 +159,25 @@ pub(crate) fn decide(queue: &SessionQueue, facts: &Facts) -> Decision {
             }
             return wait("blocked on a prompt: never sent until it is answered");
         }
-        AgentStatus::Working => return wait("working: waiting for its turn to finish"),
+        AgentStatus::Working => {
+            if mid_turn_key(head, facts).is_none() {
+                return wait("working: waiting for its turn to finish");
+            }
+            if status.state == State::Compacting {
+                return wait("compacting its context: waiting until it is done");
+            }
+            if !taken_up(queue, facts, status) {
+                return wait(
+                    "working: waiting for it to take up the last message sent into its turn",
+                );
+            }
+            return guarded(head, facts);
+        }
         AgentStatus::Unknown => return wait("waiting for the agent to report a status"),
         AgentStatus::Done | AgentStatus::Idle => {}
     }
     if let Some(last) = queue.last_delivered_at
-        && status.since <= last
+        && !taken_up(queue, facts, status)
     {
         let ago = (facts.now - last).to_std().unwrap_or_default();
         if ago >= facts.ack {
@@ -124,6 +204,12 @@ pub(crate) fn decide(queue: &SessionQueue, facts: &Facts) -> Decision {
     if rested < SETTLE {
         return wait("just finished: settling");
     }
+    guarded(head, facts)
+}
+
+/// `head` goes unless someone else holds or types into the session.
+fn guarded(head: &QueueItem, facts: &Facts) -> Decision {
+    let wait = |why: &str| Decision::Wait(why.to_owned());
     if let Some(owner) = &facts.owner {
         return Decision::Wait(format!("{owner} is using the session"));
     }
@@ -167,7 +253,9 @@ pub(crate) fn unacked(queue: &SessionQueue, facts: &Facts) -> Option<Option<Stri
     }
     let last = queue.last_delivered_at?;
     let status = facts.status.as_ref()?;
-    if !matches!(status.status, AgentStatus::Done | AgentStatus::Idle) || status.since > last {
+    if !matches!(status.status, AgentStatus::Done | AgentStatus::Idle)
+        || taken_up(queue, facts, status)
+    {
         return None;
     }
     if (facts.now - last).to_std().unwrap_or_default() < facts.ack {

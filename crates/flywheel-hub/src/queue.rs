@@ -67,7 +67,7 @@ mod input_line;
 mod runtime;
 
 pub use api::Delivery;
-pub(crate) use deciding::{Presence, event_item, event_text};
+pub(crate) use deciding::{Presence, Steering, Submit, event_item, event_text};
 pub use runtime::{EDIT_LEASE, QueueRuntime, SessionHold, TypingExport};
 
 /// Pending items per session.
@@ -208,6 +208,11 @@ pub struct SessionQueue {
     /// The latest delivery (the next item waits for a rest after it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_delivered_at: Option<DateTime<Utc>>,
+    /// That latest delivery went into a running turn: it is taken up when
+    /// the agent takes a prompt in after it (a turn's status need not
+    /// move), not when its turn changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mid_turn: bool,
     #[serde(default)]
     pub items: Vec<QueueItem>,
     /// The delivered item sent again because the agent never took it up
@@ -345,6 +350,7 @@ impl SessionQueue {
     pub fn retry(&mut self) {
         self.stalled = None;
         self.last_delivered_at = None;
+        self.mid_turn = false;
     }
 
     /// Nothing worth keeping (the store drops it).

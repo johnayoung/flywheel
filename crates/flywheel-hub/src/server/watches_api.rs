@@ -42,6 +42,22 @@ pub(super) async fn add_watch(
     Ok((StatusCode::CREATED, Json(watch)).into_response())
 }
 
+/// The body of `PATCH /api/watches/{id}`.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct WatchEdit {
+    prompt: String,
+}
+
+pub(super) async fn edit_watch(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(edit): ApiJson<WatchEdit>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let edited = blocking(move || hub.watch_edit(&id, &edit.prompt, None)).await?;
+    Ok(Json(edited).into_response())
+}
+
 pub(super) async fn remove_watch(
     State(app): State<AppState>,
     Path(id): Path<String>,

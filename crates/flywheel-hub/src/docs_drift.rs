@@ -698,8 +698,9 @@ const HUB_DOCS_MAX_BYTES: usize = 103 * 1024;
 /// Raised to 27 KiB for agent starts (two routes, four session fields),
 /// and to 28 KiB for labels and the event log (two routes, a socket
 /// parameter, two message types); to 29 KiB for leases and review records
-/// (seven routes), after condensing api.md's session and file rows.
-const PAGE_MAX_BYTES: usize = 29 * 1024;
+/// (seven routes), after condensing api.md's session and file rows; to
+/// 30 KiB for watch edits (a route), api.md being at its budget.
+const PAGE_MAX_BYTES: usize = 30 * 1024;
 /// The longest line any hub page may hold: a line longer than this is a
 /// paragraph that wants splitting or cutting.
 const LINE_MAX_CHARS: usize = 400;

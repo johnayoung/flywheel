@@ -374,7 +374,7 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 |---|---|---|
 | GET | `/api/queues` | every session's queue |
 | GET / POST | `/api/watches[?session=]` | list/arm `{"owner","filter"\|"at"\|"every","prompt","window_secs"?,"pace_secs"?,"after"?}` -> 201; 400 non-agent; 409 >20/owner, >2000/hub |
-| DELETE | `/api/watches/{id}` | disarm (id, 4+ prefix) |
+| PATCH / DELETE | `/api/watches/{id}` | `{"prompt"}` / disarm (4+ prefix) |
 | GET / POST | `/api/leases[?resource=]` | ask `{"resource","mode"?,"ttl_secs"?,"wait_secs"?,"note"?,"holder"?}`: 202 waiting, 409 busy |
 | GET / DELETE | `/api/leases/waiters/{id}[?wait=]` | collect (202: waiting) / cancel |
 | POST | `/api/leases/{id}/renew` | `{"holder"?,"ttl_secs"?}` |

@@ -619,6 +619,28 @@ async fn a_compacted_lead_gets_its_children_watches_and_ask_back() {
             None
         );
     }
+    // Its watch's standing instruction went stale: the operator rewrites it.
+    let watch = t.get(&format!("/api/watches?session={}", lead.id)).await["watches"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, edited) = t
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/api/watches/{}", &watch[..6]),
+            Some(json!({ "prompt": "Review each report, then merge." })),
+        )
+        .await;
+    assert!(status.is_success(), "{edited}");
+    assert_eq!(edited["prompt"], "Review each report, then merge.");
+    let (status, _) = t
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/api/watches/{watch}"),
+            Some(json!({ "prompt": "  " })),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     // After a compaction the hub says what it owns, exactly.
     let brief = hook_context(&lead, "SessionStart", json!({ "source": "compact" }))
         .await
@@ -632,7 +654,11 @@ async fn a_compacted_lead_gets_its_children_watches_and_ask_back() {
         brief.contains(&format!("- c1 (id {})", child.id)),
         "{brief}"
     );
-    assert!(brief.contains("Your watches:\n- w"), "{brief}");
+    assert!(brief.contains("Your watches (a stale prompt"), "{brief}");
+    assert!(
+        brief.contains("pace 300s: \"Review each report, then merge.\""),
+        "{brief}"
+    );
     assert!(brief.contains("pace 300s"), "{brief}");
     assert!(brief.contains("Should I deploy 665691e6?"), "{brief}");
     // A worker with nothing of its own still learns to reload its tools.

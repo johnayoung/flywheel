@@ -603,6 +603,52 @@ impl Hub {
             }
         ));
         lines.push(starter.unwrap_or_else(|| "started by the operator".to_owned()));
+        // Where its work stands and what it has not read yet: what a lead
+        // rules on (a worker mid-rebase, or still to read the last ruling).
+        if let Ok((true, tip)) = crate::git::git_answer(
+            &target.cwd,
+            &["log", "-1", "--format=%h (%cr) %s", "--no-show-signature"],
+        ) && !tip.is_empty()
+        {
+            let branch = match crate::git::git_answer(
+                &target.cwd,
+                &["symbolic-ref", "-q", "--short", "HEAD"],
+            ) {
+                Ok((true, branch)) if !branch.is_empty() => branch,
+                _ => "detached HEAD".to_owned(),
+            };
+            let tip: String = tip.chars().take(160).collect();
+            lines.push(format!("tip: {branch} at {tip}"));
+        }
+        let waiting: Vec<(Option<String>, i64)> = self
+            .store()
+            .queue(&target.id)
+            .map(|q| {
+                q.waiting()
+                    .map(|i| (i.from.clone(), i.added_at.timestamp_millis()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let unread: Vec<(String, i64)> = waiting
+            .into_iter()
+            .map(|(from, at)| {
+                let from =
+                    from.map_or_else(|| "the operator".to_owned(), |id| self.session_name(&id));
+                (from, at)
+            })
+            .collect();
+        if let Some(oldest) = unread.iter().map(|(_, at)| *at).min() {
+            let mut from: Vec<&str> = unread.iter().map(|(f, _)| f.as_str()).collect();
+            from.sort_unstable();
+            from.dedup();
+            lines.push(format!(
+                "unread: {} queued message{} (oldest {} ago; from {}), read when its turn ends",
+                unread.len(),
+                if unread.len() == 1 { "" } else { "s" },
+                span(now - oldest),
+                from.join(", ")
+            ));
+        }
         lines.push(format!(
             "runtime: {}",
             // An ended session ran until it ended.

@@ -123,6 +123,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
         })],
         "SessionEnd" => vec![main(What::SessionFinished {
             reason: owned(payload, "reason"),
+            by: None,
         })],
         "UserPromptSubmit" => vec![main(What::TurnStarted {
             title: prompt_title(str_of(payload, "prompt").unwrap_or_default()),
@@ -265,6 +266,8 @@ fn prompt_title(prompt: &str) -> String {
 /// What a plan tool's call (or the hub's ask tool's) declares.
 fn declared(tool: &str, input: &Value) -> Option<What> {
     match tool {
+        // A refused ask (see `ask_problem`) is no ask: the agent asks again.
+        ASK_TOOL if super::ask::ask_problem(input).is_some() => None,
         ASK_TOOL => Some(What::Asked {
             kind: AskKind::parse(str_of(input, "kind").unwrap_or("answer")),
             text: summary::text(str_of(input, "text").or_else(|| str_of(input, "question"))?),

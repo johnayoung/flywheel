@@ -370,6 +370,12 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn edit_watch(&self, id: &str, prompt: &str) -> Result<String, String> {
+        self.hub
+            .agent_watch_edit(&self.session, id, prompt)
+            .map_err(|e| e.to_string())
+    }
+
     fn unwatch(&self, id: &str) -> Result<String, String> {
         self.hub
             .agent_unwatch(&self.session, id)

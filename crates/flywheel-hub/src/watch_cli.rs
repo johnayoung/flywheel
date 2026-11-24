@@ -23,8 +23,23 @@ enum WatchCommand {
     /// Every armed watch (or SESSION's): its filter, prompts queued, and
     /// events matched.
     Ls(LsArgs),
+    /// Replace a watch's prompt (its filter or time, and its cursor, stay).
+    Edit(EditArgs),
     /// Disarm a watch (a prompt it queued stays queued).
     Rm(RmArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct EditArgs {
+    /// The watch (its id or a prefix of 4+).
+    watch: String,
+    /// What the session is told when it fires from now on (`-`: read stdin).
+    prompt: String,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,6 +151,28 @@ fn run(args: &WatchArgs, out: &mut dyn Write) -> Result<(), String> {
                 print_json(out, &listed);
             } else {
                 print_watches(out, &listed, &conn);
+            }
+        }
+        WatchCommand::Edit(edit) => {
+            let prompt = if edit.prompt == "-" {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|e| format!("cannot read stdin: {e}"))?;
+                text
+            } else {
+                edit.prompt.clone()
+            };
+            let conn = Endpoint::resolve(&edit.endpoint)?;
+            let edited = conn.blocking_call(
+                "PATCH",
+                &format!("/api/watches/{}", query_escape(edit.watch.trim())),
+                Some(&json!({ "prompt": prompt })),
+            )?;
+            if edit.json {
+                print_json(out, &edited);
+            } else {
+                let _ = writeln!(out, "edited {}", str_field(&edited, "id"));
             }
         }
         WatchCommand::Rm(rm) => {

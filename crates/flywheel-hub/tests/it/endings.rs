@@ -2992,6 +2992,8 @@ async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
         let ask = json!({"tool_name": "mcp__flywheel__ask_operator", "tool_use_id": "tu1",
                          "tool_input": {"kind": "decide", "text": "Which region?",
                                         "options": ["eu-west", "us-east"], "hold": "awaiting_approval",
+                                        "recommendation": "eu-west",
+                                        "context": "Most users are in Europe; us-east doubles their latency.",
                                         "cause": "deploy region", "recommendation": "eu-west"}});
         agent.hook("PreToolUse", ask.clone()).await;
         agent.hook("PostToolUse", ask).await;
@@ -3184,4 +3186,130 @@ async fn a_leads_rulings_survive_its_compaction_and_pass_to_its_successor() {
     let held = next.ok(ruling, json!({})).await;
     assert!(held.starts_with("Your rulings (2):"), "{held}");
     assert!(held.contains("Never merge without a review."), "{held}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_that_dies_wakes_its_lead_and_one_it_ended_does_not() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let ended = hub.claude("ended-kid", Some(&lead), json!({})).await;
+    let dead = hub.claude("dead-kid", Some(&lead), json!({})).await;
+    for agent in [&lead, &ended, &dead] {
+        agent.turn().await;
+    }
+    // Its watch names only turn states; a child's end still wakes it.
+    let watches = hub.get(&format!("/api/watches?session={}", lead.id)).await;
+    assert!(
+        !watches["watches"][0]["filter"]["states"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ended")),
+        "{watches}"
+    );
+    // One that dies (here: killed by the operator): it hears at once.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{}/kill", dead.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    lead.typed_has("session.finished").await;
+    assert!(lead.typed().contains("dead-kid"), "{}", lead.typed());
+    lead.turn().await;
+    // One it ends itself: no news to it beyond the hub's own word.
+    lead.ok("end_session", json!({"to": "ended-kid", "mode": "at_rest"}))
+        .await;
+    lead.typed_has("ended-kid (id").await;
+    lead.turn().await;
+    hub.gone(&ended.id).await;
+    sleep(Duration::from_secs(4)).await;
+    let typed = lead.typed();
+    assert_eq!(typed.matches("session.finished").count(), 1, "{typed}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workers_status_shows_its_branch_tip_and_what_it_has_not_read() {
+    let mut hub = TestHub::start().await;
+    let repo = hub.root.join("repo");
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("f"), "1\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "-q", "-m", "fix the bench"]);
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let kid = hub.claude("kid", Some(&lead), json!({})).await;
+    for agent in [&lead, &kid] {
+        agent.turn().await;
+    }
+    kid.hook("UserPromptSubmit", json!({"prompt": "work"}))
+        .await;
+    lead.ok(
+        "message_session",
+        json!({"to": "kid", "text": "Rebase first."}),
+    )
+    .await;
+    let status = lead.ok("session_status", json!({"to": "kid"})).await;
+    assert!(status.contains("\ntip: main at "), "{status}");
+    assert!(status.contains(" fix the bench"), "{status}");
+    assert!(
+        status.contains("unread: 1 queued message (oldest ") && status.contains("from lead)"),
+        "{status}"
+    );
+    kid.hook("Stop", json!({})).await;
+    kid.typed_has("Rebase first.").await;
+    kid.hook("UserPromptSubmit", json!({"prompt": "Rebase first."}))
+        .await;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let status = lead.ok("session_status", json!({"to": "kid"})).await;
+        if !status.contains("unread:") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still unread: {status}");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_rewrites_its_own_watch_prompt_and_no_one_elses() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    let other = hub.claude("other", None, json!({})).await;
+    for agent in [&lead, &other] {
+        agent.turn().await;
+    }
+    let armed = lead
+        .ok(
+            "watch",
+            json!({"every": "6h", "prompt": "Drive the release."}),
+        )
+        .await;
+    let listed = hub.get(&format!("/api/watches?session={}", lead.id)).await;
+    let id = listed["watches"][0]["id"].as_str().unwrap().to_owned();
+    assert!(armed.contains(&id[..7]), "{armed}");
+    let said = lead
+        .ok(
+            "watch",
+            json!({"id": id, "prompt": "Release shipped: check the soak."}),
+        )
+        .await;
+    assert!(said.contains("now says: Release shipped"), "{said}");
+    let listed = hub.get(&format!("/api/watches?session={}", lead.id)).await;
+    assert_eq!(
+        listed["watches"][0]["prompt"],
+        "Release shipped: check the soak."
+    );
+    assert!(listed["watches"][0]["time"].is_object(), "{listed}");
+    let (refused, why) = other
+        .tool("watch", json!({"id": id, "prompt": "mine now"}))
+        .await;
+    assert!(refused && why.contains("not yours"), "{why}");
+    let (refused, why) = lead
+        .tool("watch", json!({"id": id, "prompt": "x", "every": "1h"}))
+        .await;
+    assert!(refused && why.contains("give only prompt"), "{why}");
 }

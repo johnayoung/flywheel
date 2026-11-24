@@ -918,10 +918,14 @@ impl Hub {
         // Its watches end with it, unless the hub hung it up (a stop, a
         // relaunch after an upgrade): it comes back as itself.
         let stopping = self.activity().is_stopping();
-        let relaunching = self
-            .store()
-            .session(id)
-            .is_ok_and(|r| r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()));
+        let (relaunching, by) = self.store().session(id).map_or((false, None), |r| {
+            let by = r
+                .ending
+                .as_ref()
+                .map(|e| e.by.tag())
+                .or_else(|| r.ended.as_ref().map(|e| e.by.tag()));
+            (r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()), by)
+        });
         let _ = self.store().mark_exited(id, exit);
         if !stopping && !relaunching {
             // Its children pass to its successor (or up its chain) now that
@@ -931,7 +935,14 @@ impl Hub {
             self.drop_watches_of(id);
             self.drop_leases_of(id);
         }
-        self.record_exit(id);
+        let reason = if stopping {
+            "hub stop"
+        } else if relaunching {
+            "relaunch"
+        } else {
+            crate::watch::EXITED
+        };
+        self.record_exit(id, reason, by);
         if let Some(generation) = generation {
             let source = StatusSource::Hub {
                 reason: "the agent's process exited".into(),

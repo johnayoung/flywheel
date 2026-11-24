@@ -294,7 +294,9 @@ impl Hub {
 
     /// The session's process exited: its telemetry ends (when the agent
     /// did not say so itself). Sessions that never reported have none.
-    pub(super) fn record_exit(&self, id: &str) {
+    /// `reason`: [`crate::watch::EXITED`] when it exited on its own or was
+    /// ended (`by` who), else why the hub hung it up.
+    pub(super) fn record_exit(&self, id: &str, reason: &str, by: Option<String>) {
         self.capture
             .status_lines
             .lock()
@@ -306,7 +308,8 @@ impl Hub {
                 vec![Draft::new(
                     now_ms(),
                     What::SessionFinished {
-                        reason: Some("exited".to_owned()),
+                        reason: Some(reason.to_owned()),
+                        by,
                     },
                 )],
             );

@@ -13,6 +13,63 @@ use serde::{Deserialize, Serialize};
 
 use super::event::{AskKind, HoldKind};
 
+/// Shortest `context` a decision or an approval carries: a sentence or
+/// two on the situation and why the recommendation.
+pub const MIN_CONTEXT_CHARS: usize = 40;
+
+/// Why an `ask_operator` call's `input` is not an ask the operator can
+/// decide from the card alone; `None` when it is. A choice or a yes-or-no
+/// needs what each answer means and the agent's recommendation, the way a
+/// question tool's options each carry a description and the recommended
+/// one comes first. The hub records no ask for a refused call, and the
+/// tool says why, so the agent asks again whole.
+pub fn ask_problem(input: &serde_json::Value) -> Option<String> {
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    if text("text").or_else(|| text("question")).is_none() {
+        return Some("give text: the ask in one plain sentence".into());
+    }
+    let kind = AskKind::parse(text("kind").unwrap_or("answer"));
+    let approval = text("hold").and_then(HoldKind::parse) == Some(HoldKind::AwaitingApproval);
+    if kind == AskKind::Decide {
+        let options = input
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, |o| {
+                o.iter()
+                    .filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+                    .count()
+            });
+        if options < 2 {
+            return Some("a decide ask gives at least 2 options, recommended first".into());
+        }
+    }
+    if kind == AskKind::Decide || approval {
+        let what = if approval {
+            "an approval"
+        } else {
+            "a decide ask"
+        };
+        if text("context").is_none_or(|c| c.chars().count() < MIN_CONTEXT_CHARS) {
+            return Some(format!(
+                "{what} gives context: the situation, what each answer leads to, and why you \
+                 recommend yours, so the operator decides from the card alone"
+            ));
+        }
+        if text("recommendation").is_none() {
+            return Some(format!(
+                "{what} gives recommendation: the answer you would pick"
+            ));
+        }
+    }
+    None
+}
+
 /// What a session waits on the operator for, once its turn has ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ask {

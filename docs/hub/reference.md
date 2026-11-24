@@ -162,6 +162,7 @@ fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
 fw hub watch add SESSION (--on FILTER | --at TIME | --every SPAN) --prompt TEXT|- [--window SECS] [--pace SECS] [--after CURSOR] [--json] {where}
 fw hub watch ls [SESSION] [--json] {where}
+fw hub watch edit WATCH PROMPT|- [--json] {where}  # new prompt; filter, time, cursor stay
 fw hub watch rm WATCH [--json] {where}  # a prompt it queued stays
 fw hub lease acquire RESOURCE [--shared] [--ttl SPAN] [--wait SPAN] [--note T] [--json] {where}
 fw hub lease run RESOURCE [--shared] [--ttl SPAN] [--wait SPAN] [--note T] [--or-flock PATH] {where} -- CMD...

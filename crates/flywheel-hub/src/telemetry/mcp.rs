@@ -178,6 +178,8 @@ pub trait Host {
         at: Option<&str>,
         every: Option<&str>,
     ) -> Result<String, String>;
+    /// Replace the prompt of the caller's watch `id`.
+    fn edit_watch(&self, id: &str, prompt: &str) -> Result<String, String>;
     /// Disarm one of the caller's watches (`all`: every one).
     fn unwatch(&self, id: &str) -> Result<String, String>;
     /// Acquire, release, or list leases for the caller.
@@ -217,7 +219,8 @@ before you start, and again each time a step starts, finishes, or the plan chang
 whole list, with exactly one step in_progress while you work. Keep step titles short. When you \
 cannot go on without the operator (an answer, a decision between options, or a command only they \
 can run, such as one needing sudo or another machine), call mcp__flywheel__ask_operator once \
-with that ask, then end your turn. When the work should go on in a fresh session, call \
+with that ask, then end your turn; an update that needs nothing from them is no ask: end your turn \
+with it. When the work should go on in a fresh session, call \
 mcp__flywheel__handoff with that session's whole prompt instead of printing one. To delegate \
 parallel work to a new agent session, call mcp__flywheel__start_session (handoff stays for \
 continuing your own work); to wait on the sessions you started, call mcp__flywheel__watch once \
@@ -273,7 +276,10 @@ fn ask_tool() -> Value {
                         yes or no on something you want to do), cause (a short key shared by asks \
                         the operator can answer together), recommendation (your answer). Give \
                         context: by the time they read it the conversation has moved on, so \
-                        say what they need to answer from the card alone.",
+                        say what they need to answer from the card alone; decide and \
+                        awaiting_approval require context and recommendation. Not for updates \
+                        that need nothing from them: end your turn with those (your closing \
+                        message is your report on their board).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -682,10 +688,13 @@ fn watch_tool() -> Value {
                         repeatedly; a time watch survives hub restarts and passes to your \
                         successor. A finished turn's closing message (its report) comes in \
                         full with its event. Arming a filter you already watch replaces that \
-                        watch's prompt. A watch lasts until unwatch or until you end.",
+                        watch's prompt; id (any watch of yours, time ones too) with prompt \
+                        replaces only its prompt, when the old one no longer holds. A watch \
+                        lasts until unwatch or until you end.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "id": { "type": "string", "description": "Optional: a watch of yours (its id) whose prompt to replace; give only prompt with it." },
                 "filter": { "type": "string", "description": "What to watch for (see above); not with at or every." },
                 "at": { "type": "string", "description": "Optional: wake once at this time (RFC 3339 UTC, or +36h)." },
                 "every": { "type": "string", "description": "Optional: wake this often (6h, 1d; at least 5m); with at, from then." },
@@ -1128,19 +1137,37 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         .map(|w| u32::try_from(w).unwrap_or(u32::MAX))
                 };
                 let given = |key: &str| Some(arg(key).trim()).filter(|v| !v.is_empty());
-                Ok(
-                    match host.watch(
-                        arg("filter"),
-                        arg("prompt"),
-                        secs("window_secs"),
-                        secs("pace_secs"),
-                        given("at"),
-                        given("every"),
-                    ) {
-                        Ok(said) => text_result(said, false),
-                        Err(why) => text_result(format!("Not watching: {why}"), true),
-                    },
-                )
+                if let Some(id) = given("id") {
+                    let extra = ["filter", "at", "every", "window_secs", "pace_secs"]
+                        .iter()
+                        .any(|k| args.get(*k).is_some_and(|v| !v.is_null() && v != ""));
+                    Ok(if extra {
+                        text_result(
+                            "Not edited: with id, give only prompt (unwatch and arm again to \
+                             change the rest)",
+                            true,
+                        )
+                    } else {
+                        match host.edit_watch(id, arg("prompt")) {
+                            Ok(said) => text_result(said, false),
+                            Err(why) => text_result(format!("Not edited: {why}"), true),
+                        }
+                    })
+                } else {
+                    Ok(
+                        match host.watch(
+                            arg("filter"),
+                            arg("prompt"),
+                            secs("window_secs"),
+                            secs("pace_secs"),
+                            given("at"),
+                            given("every"),
+                        ) {
+                            Ok(said) => text_result(said, false),
+                            Err(why) => text_result(format!("Not watching: {why}"), true),
+                        },
+                    )
+                }
             } else if name == Some(LEASE_TOOL) {
                 let text = |key: &str| {
                     Some(arg(key).trim())
@@ -1218,6 +1245,8 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     Ok(said) => text_result(said, false),
                     Err(why) => text_result(format!("Not given: {why}"), true),
                 })
+            } else if let (Some(ASK_TOOL), Some(why)) = (name, super::ask::ask_problem(args)) {
+                Ok(text_result(format!("Not asked: {why}."), true))
             } else if name == Some(ASK_TOOL) {
                 Ok(json!({
                     "content": [{ "type": "text", "text": "The operator sees your ask. End your turn now; their reply arrives as your next prompt." }],
@@ -1400,6 +1429,9 @@ mod tests {
             Ok(format!(
                 "{filter} / {prompt} / {window_secs:?} / {pace_secs:?}"
             ))
+        }
+        fn edit_watch(&self, id: &str, prompt: &str) -> Result<String, String> {
+            Ok(format!("edited {id}: {prompt}"))
         }
         fn unwatch(&self, id: &str) -> Result<String, String> {
             Ok(format!("unwatched {id}"))

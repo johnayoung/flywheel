@@ -322,6 +322,10 @@ pub enum What {
     SessionFinished {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Who ended it (a session's id, or `operator`), when it was ended
+        /// on purpose rather than exiting on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     /// A prompt was submitted: the agent starts working on it.
     #[serde(rename = "turn.started")]

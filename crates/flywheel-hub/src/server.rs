@@ -314,7 +314,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route(
             "/api/watches/{id}",
-            axum::routing::delete(watches_api::remove_watch),
+            axum::routing::delete(watches_api::remove_watch).patch(watches_api::edit_watch),
         )
         .route(
             "/api/leases",

@@ -788,7 +788,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             by: "s1".into(),
             items: 2,
         },
-        What::SessionFinished { reason: None },
+        What::SessionFinished {
+            reason: None,
+            by: None,
+        },
         What::TurnStarted {
             title: "t".into(),
             relayed: false,
@@ -1500,7 +1503,7 @@ fn relay(telemetry: &Telemetry, session: &str, at: i64, prompt: &str) {
 fn a_relayed_prompt_does_not_answer_the_ask() {
     let (_dir, telemetry) = open();
     let decide = json!({"tool_name": claude::ASK_TOOL, "tool_use_id": "a1",
-        "tool_input": {"kind": "decide", "text": "Restart live on rh-node now?"}});
+        "tool_input": {"kind": "decide", "text": "Restart live on rh-node now?", "options": ["yes", "no"], "recommendation": "yes", "context": "The soak is clean for six hours and the fix is reviewed; restarting applies it."}});
     hooks(
         &telemetry,
         "lead",
@@ -1575,7 +1578,7 @@ fn a_newer_declared_ask_replaces_the_one_a_relay_held() {
     let (_dir, telemetry) = open();
     let ask = |id: &str, text: &str| {
         json!({"tool_name": claude::ASK_TOOL, "tool_use_id": id,
-            "tool_input": {"kind": "decide", "text": text}})
+            "tool_input": {"kind": "decide", "text": text, "options": ["yes", "no"], "recommendation": "yes", "context": "The soak is clean for six hours and the fix is reviewed; restarting applies it."}})
     };
     hooks(
         &telemetry,
@@ -1798,7 +1801,13 @@ fn captured_runs_are_rolled_up_by_batch_parent_or_outside() {
             ),
         ];
         if end {
-            drafts.push(Draft::new(at, What::SessionFinished { reason: None }));
+            drafts.push(Draft::new(
+                at,
+                What::SessionFinished {
+                    reason: None,
+                    by: None,
+                },
+            ));
         }
         telemetry.record(id, drafts);
     };
@@ -2545,5 +2554,43 @@ fn an_ask_carries_the_context_to_answer_it_from_the_card() {
             .as_deref()
             .is_some_and(|c| c.starts_with("Two ways: A keeps the cache")),
         "{ask:?}"
+    );
+}
+
+#[test]
+fn a_decision_without_what_it_means_is_refused_and_not_recorded() {
+    use super::ask::ask_problem;
+    let bare = json!({"kind": "decide", "text": "Ship it?", "options": ["yes", "no"]});
+    assert!(ask_problem(&bare).unwrap().contains("context"));
+    let one = json!({"kind": "decide", "text": "Ship it?", "options": ["yes"],
+                     "context": "The review is READY and the soak is clean for six hours.",
+                     "recommendation": "yes"});
+    assert!(ask_problem(&one).unwrap().contains("2 options"));
+    let unrecommended = json!({"kind": "decide", "text": "Ship it?", "options": ["yes", "no"],
+                               "context": "The review is READY and the soak is clean for six hours."});
+    assert!(
+        ask_problem(&unrecommended)
+            .unwrap()
+            .contains("recommendation")
+    );
+    let whole = json!({"kind": "decide", "text": "Ship it?", "options": ["yes", "no"],
+                       "context": "The review is READY and the soak is clean for six hours.",
+                       "recommendation": "yes"});
+    assert_eq!(ask_problem(&whole), None);
+    let approval = json!({"kind": "answer", "text": "May I delete 106 GB of review targets?",
+                          "hold": "awaiting_approval"});
+    assert!(ask_problem(&approval).unwrap().starts_with("an approval"));
+    // A plain question needs nothing more.
+    assert_eq!(ask_problem(&json!({"text": "Which region?"})), None);
+    // A refused call records no ask.
+    let drafts = super::claude::hook(
+        "PreToolUse",
+        &json!({"tool_name": super::claude::ASK_TOOL, "tool_input": bare,
+                "tool_use_id": "t1"}),
+        0,
+    );
+    assert!(
+        !drafts.iter().any(|d| matches!(d.what, What::Asked { .. })),
+        "{drafts:?}"
     );
 }

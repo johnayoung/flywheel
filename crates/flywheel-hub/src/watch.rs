@@ -66,6 +66,20 @@ pub const RESUME_PROMPT: &str = "Your last turn stopped on a rate limit, which h
 pub const RESUME_FALLBACK_SECS: i64 = 15 * 60;
 /// The watch the hub arms for a session when it starts its first child
 /// ([`Hub::ensure_children_watch`]).
+/// The reason the hub records for a session's process that exited on its
+/// own or was ended (not hung up by the hub for a relaunch or a stop).
+pub const EXITED: &str = "exited";
+
+/// Whether `row` is a session's real end, for a watch owned by `owner`:
+/// the hub saw its process exit on its own, or ended by someone other
+/// than `owner` (an end `owner` asked for is no news to it). A relaunch,
+/// a hub stop, and the agent's own end report are not.
+fn real_end(row: &LogRow, owner: &str) -> bool {
+    row.kind == "session.finished"
+        && row.body.get("reason").and_then(serde_json::Value::as_str) == Some(EXITED)
+        && row.body.get("by").and_then(serde_json::Value::as_str) != Some(owner)
+}
+
 pub const DEFAULT_CHILDREN_FILTER: &str = "children state=done|blocked|failed|asking";
 /// That watch's prompt.
 pub const DEFAULT_CHILDREN_PROMPT: &str = "A session you started moved (the hub armed this \
@@ -656,6 +670,50 @@ impl Hub {
     }
 
     /// The `unwatch` agent tool: disarm one of `caller`'s watches, or all.
+    /// Replace watch `id`'s prompt (an event or a time watch), keeping its
+    /// filter, schedule, and cursor; `owner`: only when it is theirs. A
+    /// standing instruction goes stale; this keeps the watch.
+    pub fn watch_edit(
+        &self,
+        id: &str,
+        prompt: &str,
+        owner: Option<&str>,
+    ) -> Result<Watch, HubError> {
+        let watch = self.watch_named(id)?;
+        if owner.is_some_and(|o| o != watch.owner) {
+            return Err(
+                StateError::Invalid(format!("watch {} is not yours", watch.short())).into(),
+            );
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(StateError::Invalid(format!(
+                "a watch's prompt is 1-{MAX_PROMPT_BYTES} bytes: what to do when it fires"
+            ))
+            .into());
+        }
+        let edited = self
+            .store()
+            .rearm_watch(&watch.id, prompt, watch.window_secs, None)?;
+        self.queue_changed();
+        Ok(edited)
+    }
+
+    /// The `watch` tool given an `id`: replace that watch's prompt.
+    pub fn agent_watch_edit(
+        &self,
+        caller: &str,
+        id: &str,
+        prompt: &str,
+    ) -> Result<String, HubError> {
+        let watch = self.watch_edit(id, prompt, Some(caller))?;
+        Ok(format!(
+            "Watch {} now says: {}",
+            watch.short(),
+            watch.prompt
+        ))
+    }
+
     pub fn agent_unwatch(&self, caller: &str, id: &str) -> Result<String, HubError> {
         if id.trim() == "all" {
             let mine = self.watches(Some(caller));
@@ -899,7 +957,16 @@ impl Hub {
                     {
                         continue;
                     }
-                    if queries[at].matches(row, now) {
+                    // An end matches only when real; a children watch always
+                    // hears a child's real end, whatever states it names.
+                    let hit = if row.state.as_deref() == Some("ended") {
+                        real_end(row, &watches[at].owner)
+                            && (watches[at].filter.children.is_some()
+                                || queries[at].matches(row, now))
+                    } else {
+                        queries[at].matches(row, now)
+                    };
+                    if hit {
                         matched.push((at, row.clone()));
                     }
                 }
@@ -1297,6 +1364,38 @@ mod pace_tests {
     }
 
     const SEC: Duration = Duration::from_secs(1);
+
+    fn finished(body: serde_json::Value) -> LogRow {
+        LogRow {
+            kind: "session.finished".into(),
+            body,
+            ..moved("ended")
+        }
+    }
+
+    #[test]
+    fn only_a_real_end_the_owner_did_not_ask_for_counts() {
+        use serde_json::json;
+        assert!(real_end(&finished(json!({"reason": EXITED})), "lead"));
+        assert!(real_end(
+            &finished(json!({"reason": EXITED, "by": "operator"})),
+            "lead"
+        ));
+        // Its owner ended it: no news.
+        assert!(!real_end(
+            &finished(json!({"reason": EXITED, "by": "lead"})),
+            "lead"
+        ));
+        // The hub hung it up to bring it back, or stopped.
+        assert!(!real_end(&finished(json!({"reason": "relaunch"})), "lead"));
+        assert!(!real_end(&finished(json!({"reason": "hub stop"})), "lead"));
+        // The agent's own end report (Claude's SessionEnd reasons).
+        assert!(!real_end(&finished(json!({"reason": "other"})), "lead"));
+        assert!(!real_end(&finished(json!({})), "lead"));
+        // An end is never held for the pace.
+        let lead = watch(true, None);
+        assert!(due(&lead, &[finished(json!({"reason": EXITED}))], SEC * 3));
+    }
 
     #[test]
     fn a_children_watch_holds_finished_turns_for_its_pace() {

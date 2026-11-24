@@ -138,13 +138,23 @@ impl Hub {
         }
         let watches = self.watches(Some(id));
         if !watches.is_empty() {
-            lines.push("Your watches:".to_owned());
+            lines.push(
+                "Your watches (a stale prompt: watch with its id and a new prompt):".to_owned(),
+            );
             for watch in &watches {
                 let on = match &watch.time {
                     Some(time) => time.words(),
                     None => format!("on `{}`, pace {}s", watch.filter, watch.pace()),
                 };
-                lines.push(format!("- {} {on}", watch.short()));
+                let prompt: String = watch
+                    .prompt
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(BRIEF_TITLE_CHARS)
+                    .collect();
+                lines.push(format!("- {} {on}: \"{prompt}\"", watch.short()));
             }
         }
         if let Some(ask) = self

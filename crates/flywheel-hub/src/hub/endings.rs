@@ -461,7 +461,7 @@ impl Hub {
         }
     }
 
-    fn session_name(&self, id: &str) -> String {
+    pub(super) fn session_name(&self, id: &str) -> String {
         self.store()
             .session(id)
             .map_or_else(|_| format!("a removed session ({id})"), |s| s.name.clone())

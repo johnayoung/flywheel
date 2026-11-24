@@ -688,8 +688,10 @@ const PAGES: [(&str, &str); 6] = [
 /// Raised to 100 KiB for the build budget (a verb, a route, three keys,
 /// a session field, an event, a board readout), after condensing api.md;
 /// to 102 KiB for the build sweep (a verb, a route, five keys, two
-/// activity kinds, its safety rules), after condensing api.md by 0.3 KB.
-const HUB_DOCS_MAX_BYTES: usize = 102 * 1024;
+/// activity kinds, its safety rules), after condensing api.md by 0.3 KB;
+/// to 103 KiB for lead rulings and fencing (an agent tool, two briefs, a
+/// successor's fence): 102 bytes were left.
+const HUB_DOCS_MAX_BYTES: usize = 103 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

@@ -340,6 +340,22 @@ impl Hub {
             })?;
             (sender, found)
         };
+        // A session whose work passed on: its successor hears it.
+        let named = target.name.clone();
+        let (target, passed_on) = self.message_target(target, &sender.id);
+        let text = match &passed_on {
+            Some(note) => format!("{note}\n\n{text}"),
+            None => text.to_owned(),
+        };
+        let text = text.as_str();
+        let redirected = if passed_on.is_some() {
+            format!(
+                " ({named}'s work passed to {}: the hub sent it there.)",
+                target.name
+            )
+        } else {
+            String::new()
+        };
         if target.id == sender.id {
             return Err(StateError::Invalid("that is this session".into()).into());
         }
@@ -384,6 +400,7 @@ impl Hub {
             ),
             _ => String::new(),
         };
+        let after_read = format!("{after_read}{redirected}");
         Ok(match delivery {
             Delivery::Pasted { .. } => {
                 format!("Delivered to {}: it reads it now.{after_read}", target.name)

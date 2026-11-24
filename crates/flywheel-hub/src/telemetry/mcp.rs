@@ -160,6 +160,11 @@ pub trait Host {
         change: &crate::labels::Change,
         cond: Option<&crate::labels::Cond>,
     ) -> Result<String, String>;
+    /// Why the caller may not call `tool` with `args` now (its work
+    /// passed to a successor); `None`: it may.
+    fn fenced(&self, _tool: &str, _args: &Value) -> Option<String> {
+        None
+    }
     /// Record, retire, or list the caller's operator rulings.
     fn record_ruling(&self, action: crate::rulings::RulingAction) -> Result<String, String>;
     /// Arm a watch that wakes the caller when the log matches `filter`,
@@ -947,7 +952,9 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str);
             let args = params.get("arguments").unwrap_or(&Value::Null);
             let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
-            if name == Some(HANDOFF_TOOL) {
+            if let Some(why) = name.and_then(|n| host.fenced(n, args)) {
+                Ok(text_result(format!("Refused: {why}"), true))
+            } else if name == Some(HANDOFF_TOOL) {
                 let given = |key: &str| Some(arg(key)).filter(|v| !v.trim().is_empty());
                 Ok(if arg("prompt").trim().is_empty() {
                     text_result("Give the new session's whole prompt.", true)

@@ -2199,6 +2199,40 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
         lead2.id.as_str(),
         "{watches}"
     );
+    assert!(argv.contains("no need to tell them you lead now"), "{argv}");
+    // The old lead is fenced: it may only pass things to its successor.
+    let (refused, why) = lead
+        .tool("message_session", json!({"to": "worker", "text": "stop"}))
+        .await;
+    assert!(refused, "{why}");
+    assert!(why.contains("lead 2 (id"), "{why}");
+    let (refused, why) = lead.tool("end_session", json!({"to": "worker"})).await;
+    assert!(refused && why.contains("took over your work"), "{why}");
+    let (refused, why) = lead
+        .tool("record_ruling", json!({"text": "late ruling"}))
+        .await;
+    assert!(refused, "{why}");
+    lead.ok("list_sessions", json!({})).await;
+    lead.ok(
+        "message_session",
+        json!({"to": "lead 2", "text": "Notes: the bench is at 41%."}),
+    )
+    .await;
+    lead2.typed_has("Notes: the bench is at 41%.").await;
+    lead2.turn().await;
+    // A worker's message to the old lead reaches the new one.
+    let said = worker
+        .ok(
+            "message_session",
+            json!({"to": "lead", "text": "Done: branch w at 1234abcd."}),
+        )
+        .await;
+    assert!(said.contains("lead's work passed to lead 2"), "{said}");
+    lead2.typed_has("Done: branch w at 1234abcd.").await;
+    lead2
+        .typed_has("(Sent to lead, whose work you took over")
+        .await;
+    lead2.turn().await;
     let (status, _) = hub
         .call(
             reqwest::Method::POST,

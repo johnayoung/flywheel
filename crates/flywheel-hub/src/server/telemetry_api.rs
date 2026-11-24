@@ -335,6 +335,10 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn fenced(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
+        self.hub.fenced(&self.session, tool, args)
+    }
+
     fn record_ruling(&self, action: crate::rulings::RulingAction) -> Result<String, String> {
         self.hub
             .agent_ruling(&self.session, action)

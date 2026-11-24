@@ -52,6 +52,10 @@ impl Hub {
                     .to_owned(),
             );
             lines.extend(self.child_lines(&children));
+            lines.push(format!(
+                "Their messages to {name} reach you, and the hub refuses {name}'s calls on the \
+                 work: no need to tell them you lead now."
+            ));
         }
         if let Some(ask) = ask {
             lines.push(format!(

@@ -231,7 +231,9 @@ const state = {
   // The sidebar's list: "all" (what needs you, what moves, the rest) or
   // one workspace's id (its rail tile).
   scope: store.get("scope", "all"),
-  restingOpen: store.get("resting-open", false), // the All list's Resting group unfolded
+  // The All list's Resting group unfolded (a phone: at first, so a tap on
+  // the menu shows every session).
+  restingOpen: store.get("resting-open", window.matchMedia("(max-width: 760px)").matches),
   groupBy: store.get("group-by", ""), // the All list grouped by this label key ("": by activity)
   endedOpen: new Set(), // leads whose ended sessions are listed (not folded)
   filter: "", // the list's filter box (app-sidebar.js matchesFilter)

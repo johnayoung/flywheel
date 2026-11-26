@@ -75,8 +75,10 @@ Object.defineProperty(state, "exited", { get: () => (focusedPane() ? focusedPane
 Object.defineProperty(state, "replaying", { get: () => !!(focusedPane() && focusedPane().replaying) });
 
 const mobile = window.FwHubMobile({
-  $, el, state, store, prefs: settings, api, sessionById, agentStatus,
+  $, el, state, store, prefs: settings, api, sessionById, agentStatus, isAgent,
   toast: commands.toast,
+  // The text view's "Replies" (commands.js).
+  openReplies: (id) => commands.openReplies(id),
   copyText: commands.copyText,
   term: () => focusedTerm(),
   pane: () => focusedPane(),

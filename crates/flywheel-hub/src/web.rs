@@ -208,6 +208,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("fleet.js", include_bytes!("../web/fleet.js"), JS),
     (
+        "app-mobile.css",
+        include_bytes!("../web/app-mobile.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
         "app-digest.css",
         include_bytes!("../web/app-digest.css"),
         "text/css; charset=utf-8",

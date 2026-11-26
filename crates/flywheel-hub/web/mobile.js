@@ -496,14 +496,40 @@ window.FwHubMobile = function (ctx) {
       toolButton("a−", "Smaller text", () => setFont(fontSize() - 1)),
       toolButton("a+", "Larger text", () => setFont(fontSize() + 1)),
     );
+    // An agent's bar: a message field (Compose) under the keys, the rest
+    // of the keys one tap away (CSS shows one or the other by the
+    // body's agent-bar / kb-more classes).
+    const message = el("button", {
+      type: "button",
+      id: "kb-msg",
+      className: "kb-msg",
+      title: "Write to the agent (Compose)",
+      onclick: () => openCompose(),
+    });
+    holdFocus(message);
     const tools = el(
       "div",
       { className: "kb-tools" },
+      toolButton("keys", "More keys: tab, ctrl, alt, symbols, text size", toggleMoreKeys, "keys-toggle"),
       toolButton("kbd", "Show / hide the keyboard", toggleKeyboard, "kbd-toggle"),
       toolButton("compose", "Write a prompt (Compose)", () => openCompose(), "compose-btn"),
     );
-    bar.replaceChildren(primary, el("div", { className: "kb-row kb-second" }, more, tools));
+    bar.replaceChildren(primary, el("div", { className: "kb-row kb-second" }, more, message, tools));
     renderMods();
+    renderMoreKeys();
+  }
+
+  // The extra keys row of an agent's bar, shown or not (per device).
+  const moreKeysOn = () => store.get("kb-more", false) === true;
+  function toggleMoreKeys() {
+    store.set("kb-more", !moreKeysOn());
+    renderMoreKeys();
+    updateBar();
+  }
+  function renderMoreKeys() {
+    document.body.classList.toggle("kb-more", moreKeysOn());
+    const button = document.querySelector("#keybar .keys-toggle");
+    if (button) button.setAttribute("aria-pressed", String(moreKeysOn()));
   }
 
   function toggleKeyboard() {
@@ -1070,10 +1096,21 @@ window.FwHubMobile = function (ctx) {
     const stage = $("#stage").getBoundingClientRect();
     pop.hidden = false;
     const width = pop.offsetWidth;
+    const height = pop.offsetHeight;
+    // Over the selection's first row, else under its last: never over
+    // what was selected (the finger's spot when the rows are unknown).
+    let over = y;
+    let under = y;
+    const range = t.getSelectionPosition && t.getSelectionPosition();
+    const geo = cells();
+    if (range && geo) {
+      const view = t.buffer.active.viewportY;
+      over = geo.rect.top + Math.max(0, range.start.y - view) * geo.height;
+      under = geo.rect.top + Math.min(t.rows, range.end.y - view + 1) * geo.height;
+    }
     const left = Math.max(4, Math.min(stage.width - width - 4, x - stage.left - width / 2));
-    // Above the finger, or below it when there is no room above.
-    const above = y - stage.top - pop.offsetHeight - 18;
-    const top = above >= 4 ? above : Math.min(stage.height - pop.offsetHeight - 4, y - stage.top + 28);
+    const above = over - stage.top - height - 8;
+    const top = above >= 4 ? above : Math.max(4, Math.min(stage.height - height - 4, under - stage.top + 8));
     pop.style.left = `${left}px`;
     pop.style.top = `${top}px`;
   }
@@ -1116,12 +1153,9 @@ window.FwHubMobile = function (ctx) {
       el("button", {
         type: "button",
         className: "slab ghost",
-        textContent: "Copy screen",
-        onclick: () => {
-          hideSelectionPop();
-          term().clearSelection();
-          copy(screenLines(false).join("\n").replace(/\s+$/, ""));
-        },
+        textContent: "Select\u2026",
+        title: "Open the text view: select any of it with the phone's own handles",
+        onclick: () => openText(),
       }),
       el("button", {
         type: "button",
@@ -1135,6 +1169,103 @@ window.FwHubMobile = function (ctx) {
         },
       }),
     );
+  }
+
+  // --- text view -------------------------------------------------------
+
+  // A phone selects text natively (handles, magnifier, select all, the
+  // system's Copy and Share) only in page text, never on the terminal's
+  // canvas. The text view is the focused terminal's scrollback and screen
+  // as page text: logical lines (a soft wrap joined back), the newest at
+  // the bottom, opened scrolled there.
+  const TEXT_LINES = 5000;
+  let textFor = null; // the session whose text is shown
+
+  function bufferText(t) {
+    const buffer = t.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buffer.length; i++) {
+      const line = buffer.getLine(i);
+      if (!line) continue;
+      const text = line.translateToString(false);
+      if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    const trimmed = lines.map((line) => line.replace(/\s+$/, ""));
+    while (trimmed.length && !trimmed[trimmed.length - 1]) trimmed.pop();
+    return trimmed.slice(-TEXT_LINES).join("\n");
+  }
+
+  function textSelection() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return "";
+    const box = $("#tv-text");
+    const range = selection.getRangeAt(0);
+    return box.contains(range.commonAncestorContainer) ? selection.toString() : "";
+  }
+
+  function openText() {
+    const t = term();
+    const session = sessionById(state.attached);
+    if (!t || !session) return;
+    hideSelectionPop();
+    t.clearSelection();
+    textFor = session.id;
+    const sheet = $("#textview");
+    $("#tv-title").textContent = session.name;
+    $("#tv-replies").hidden = !ctx.isAgent(session);
+    $("#tv-copy-sel").disabled = true;
+    const box = $("#tv-text");
+    box.textContent = bufferText(t);
+    sheet.hidden = false;
+    $("#text-toggle").setAttribute("aria-pressed", "true");
+    box.scrollTop = box.scrollHeight;
+    sheet.focus({ preventScroll: true });
+  }
+
+  function closeText() {
+    const sheet = $("#textview");
+    if (sheet.hidden) return;
+    sheet.hidden = true;
+    textFor = null;
+    $("#tv-text").textContent = "";
+    $("#text-toggle").setAttribute("aria-pressed", "false");
+  }
+
+  function bindText() {
+    $("#text-toggle").addEventListener("click", () => ($("#textview").hidden ? openText() : closeText()));
+    $("#tv-close").addEventListener("click", closeText);
+    $("#textview").addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeText();
+      }
+    });
+    // Copy keeps the selection: a tap on it must not clear it first.
+    holdFocus($("#tv-copy-sel"));
+    $("#tv-copy-sel").addEventListener("click", () => {
+      const text = textSelection();
+      if (text) copy(text);
+    });
+    $("#tv-copy-all").addEventListener("click", () => copy($("#tv-text").textContent));
+    $("#tv-replies").addEventListener("click", () => {
+      const id = textFor;
+      closeText();
+      if (id && ctx.openReplies) ctx.openReplies(id);
+    });
+    document.addEventListener("selectionchange", () => {
+      if ($("#textview").hidden) return;
+      $("#tv-copy-sel").disabled = !textSelection();
+    });
+  }
+
+  // The header's "text" pill: touch screens, a session attached.
+  function renderTextButton(session) {
+    const button = $("#text-toggle");
+    const show = !!session && coarse.matches;
+    if (button.hidden === !show) return;
+    button.hidden = !show;
+    if (!show) closeText();
   }
 
   // --- rendering -------------------------------------------------------
@@ -1175,6 +1306,18 @@ window.FwHubMobile = function (ctx) {
     const show = running && keybarWanted();
     document.body.classList.toggle("keybar-on", show);
     $("#keybar").hidden = !show;
+    const agentBar = show && ctx.isAgent(session);
+    document.body.classList.toggle("agent-bar", agentBar);
+    if (agentBar) {
+      const label = `Message ${session.name}\u2026`;
+      const message = $("#kb-msg");
+      if (message.textContent !== label) {
+        message.textContent = label;
+        message.setAttribute("aria-label", `Write to ${session.name} (Compose)`);
+      }
+    }
+    renderTextButton(session);
+    if (textFor && textFor !== state.attached) closeText();
     switchCompose();
     if (!running) closeCompose(false);
     renderQuick();
@@ -1212,6 +1355,7 @@ window.FwHubMobile = function (ctx) {
   buildKeybar();
   bindCompose();
   bindSelectionPop();
+  bindText();
   coarse.addEventListener("change", () => render());
 
   return {

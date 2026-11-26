@@ -1008,6 +1008,57 @@ try {
   check(m.panes === 1, `phone: one pane full screen (${m.panes})`);
   check(m.chips.length === 3, `phone: one chip per session, no duplicates (${JSON.stringify(m.chips)})`);
   check(m.keys > 5, `phone: key bar present (${m.keys} keys)`);
+  // The phone's session screen: every tool pill says its word; an
+  // agent's bar is keys over a message field (rarer keys one tap away);
+  // the text view is the terminal as page text, copied exactly.
+  await mp.evaluate((id) => { location.hash = `session=${id}`; }, sids[0]);
+  await mp.waitForFunction((id) => state.attached === id, sids[0], { timeout: 10000 });
+  await mp.waitForTimeout(600);
+  const tools = await mp.evaluate(() => ({
+    unlabelled: [...document.querySelectorAll(".meters .cmd-pill")].filter((n) => n.offsetParent !== null)
+      .filter((n) => !n.textContent.trim() || parseFloat(getComputedStyle(n).fontSize) < 8).map((n) => n.id),
+    first: [...document.querySelectorAll(".meters .cmd-pill")].filter((n) => n.offsetParent !== null)
+      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left).slice(0, 2).map((n) => n.id),
+    message: !!document.querySelector("#kb-msg") && document.querySelector("#kb-msg").offsetParent !== null,
+    keysHidden: document.querySelector("#keybar .kb-keys").offsetParent === null,
+  }));
+  check(tools.unlabelled.length === 0, `phone: every tool pill shows its word (${JSON.stringify(tools.unlabelled)})`);
+  check(tools.first.join() === "cmd-toggle,text-toggle", `phone: copy and text are the first tools (${tools.first})`);
+  check(tools.message && tools.keysHidden, `phone: an agent's bar is a message field, the rarer keys folded (${JSON.stringify(tools)})`);
+  await mp.tap("#keybar .keys-toggle");
+  check(await mp.evaluate(() => document.querySelector("#keybar .kb-keys").offsetParent !== null), "phone: keys unfolds the rarer keys");
+  await mp.tap("#keybar .keys-toggle");
+  await mp.tap("#kb-msg");
+  check(await mp.evaluate(() => !document.querySelector("#compose").hidden && document.activeElement.id === "compose-text"), "phone: the message field opens Compose, focused");
+  await mp.tap("#compose-close");
+  await mp.tap("#text-toggle");
+  await mp.waitForSelector("#textview:not([hidden])", { timeout: 5000 });
+  await mp.waitForTimeout(400); // its rise animation
+  const tv = await mp.evaluate(() => {
+    const box = document.querySelector("#tv-text");
+    const text = box.textContent;
+    const node = box.firstChild;
+    const at = text.indexOf("fake claude");
+    const range = document.createRange();
+    range.setStart(node, at);
+    range.setEnd(node, at + "fake claude".length);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    const r = box.getBoundingClientRect();
+    return { has: at >= 0, rect: [Math.round(r.left), Math.round(r.right), Math.round(r.bottom), innerWidth, innerHeight], full: r.width >= innerWidth - 2 && r.bottom <= innerHeight + 1, bottom: Math.abs(box.scrollTop + box.clientHeight - box.scrollHeight) < 2 || box.scrollHeight <= box.clientHeight };
+  });
+  check(tv.has && tv.full && tv.bottom, `phone: the text view shows the terminal's text, full width, at its newest line (${JSON.stringify(tv)})`);
+  await mp.waitForFunction(() => !document.querySelector("#tv-copy-sel").disabled, null, { timeout: 3000 }).catch(() => {});
+  await mp.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await mp.tap("#tv-copy-sel");
+  await mp.waitForTimeout(300);
+  check(await mp.evaluate(() => navigator.clipboard.readText()) === "fake claude", "phone: Copy selection copies the text view's selection exactly");
+  await mp.tap("#tv-close");
+  check(await mp.evaluate(() => document.querySelector("#textview").hidden), "phone: the text view closes");
+  await mp.screenshot({ path: path.join(out, "phone-agent-bar.png") });
+  await mp.evaluate((id) => { location.hash = `session=${id}`; }, sids[1]);
+  await mp.waitForFunction((id) => state.attached === id, sids[1], { timeout: 10000 });
+  await mp.waitForTimeout(600);
   // Every header button and key takes its own taps (nothing overlays them).
   const blocked = await mp.evaluate(() => {
     const targets = [

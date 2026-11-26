@@ -45,6 +45,7 @@
 <link rel="stylesheet" href="/assets/app-evals.css">
 <link rel="stylesheet" href="/assets/app-work.css">
 <link rel="stylesheet" href="/assets/app-fleet.css">
+<link rel="stylesheet" href="/assets/app-mobile.css">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" focusable="false">
@@ -75,6 +76,7 @@
   <symbol id="i-redo" viewBox="0 0 16 16"><path d="M12.6 6.2A5 5 0 1 0 13 9.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13.4 2.6v4h-4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-check" viewBox="0 0 16 16"><path d="m3 8.5 3.2 3L13 4.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
   <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-text" viewBox="0 0 16 16"><path d="M5.5 2.5h5M5.5 13.5h5M8 2.5v11" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.2" y="5.2" width="8.3" height="8.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.8 2.5H2.5v8.3" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-import" viewBox="0 0 16 16"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
@@ -179,7 +181,8 @@
         <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="out-toggle" class="cmd-pill out-pill" data-action="send-output" hidden><svg><use href="#i-send"/></svg><span id="out-label">to agent</span></button>
-        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
+        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>copy<b id="cmd-count" hidden></b></button>
+        <button type="button" id="text-toggle" class="cmd-pill text-pill" title="Text: the terminal as selectable text, to copy any of it" aria-haspopup="dialog" aria-controls="textview" hidden><svg><use href="#i-text"/></svg>text</button>
         <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
         <span id="prefix-pill" class="prefix-pill" hidden title="Pane prefix: press a key (% &quot; arrows z x c n p 1-9 , &amp; ?), Esc to cancel">ctrl b</span>
@@ -216,6 +219,21 @@
         <nav id="cmd-tabs" class="rv-tabs cmd-tabs" role="tablist" aria-label="Commands or replies"></nav>
         <ul id="cmd-list" class="cmd-list"></ul>
         <footer class="cmd-keys" aria-hidden="true"><span id="cmd-keys-commands"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</span><span id="cmd-keys-replies" hidden><kbd>1</kbd>-<kbd>9</kbd> copy the nth reply <kbd>Tab</kbd> to a copy button <kbd>Esc</kbd> close</span></footer>
+      </aside>
+      <aside id="textview" class="commands textview" hidden tabindex="-1" role="dialog" aria-labelledby="tv-title">
+        <header class="cmd-head">
+          <div class="cmd-title">
+            <span class="sheet-kicker">touch and hold to select</span>
+            <h2 id="tv-title">Text</h2>
+          </div>
+          <button type="button" class="icon" id="tv-close" title="Close (Esc)" aria-label="Close text"><svg><use href="#i-x"/></svg></button>
+        </header>
+        <div class="tv-actions">
+          <button type="button" class="slab" id="tv-copy-sel" disabled>Copy selection</button>
+          <button type="button" class="slab ghost" id="tv-copy-all">Copy all</button>
+          <button type="button" class="slab ghost" id="tv-replies" hidden>Replies</button>
+        </div>
+        <pre id="tv-text" class="tv-text"></pre>
       </aside>
       <aside id="flywheel" class="commands fw-drawer" hidden tabindex="-1" aria-label="Flywheel panel">
         <header class="cmd-head">

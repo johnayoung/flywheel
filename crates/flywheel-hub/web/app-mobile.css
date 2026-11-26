@@ -1,0 +1,136 @@
+/* flywheel hub -- The phone's session screen, last in the cascade: the
+ * labelled tool row, an agent's message bar, the text view, the Commands
+ * drawer as a sheet, and the sidebar's workspace header.
+ * Loaded after every other sheet, in index.html's order. */
+
+/* --- tool row ----------------------------------------------------------------- */
+/* Each pill an icon over its word (a bare icon said nothing a finger could
+   find), copy and text first, the row its own line under the name and
+   scrolling sideways. */
+@media (max-width: 760px) {
+  .meters { flex-basis: 100%; justify-content: flex-start; gap: .3rem; }
+  .meters .cmd-pill {
+    position: relative;
+    flex-direction: column;
+    justify-content: center;
+    gap: .22rem;
+    min-width: 3.4rem;
+    padding: .3rem .4rem .28rem;
+    font-size: 9px;
+    letter-spacing: .07em;
+    line-height: 1;
+  }
+  .meters .cmd-pill svg { width: 1rem; height: 1rem; }
+  .meters .cmd-pill b { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 .2rem; font-size: 9px; line-height: 1.3; }
+  .meters .lite-pill .lite-word { font-size: 9px; margin-left: 0; }
+  .meters .rec-pill .rec-dot { margin: 0; }
+  .meters #flip-label { display: inline; margin: 0; font-size: 9px; }
+  #cmd-toggle { order: -4; }
+  #text-toggle { order: -3; }
+  #queue-toggle { order: -2; }
+  #flip-toggle { order: -1; }
+}
+
+/* --- an agent's bar: keys, then a message field --------------------------------- */
+/* The second row of an agent's key bar is a field that opens Compose (a
+   real text area: autocorrect, dictation, one paste) and the keys / kbd
+   buttons; the rarer keys (tab, ctrl, alt, symbols, text size) show above
+   it on "keys". A shell keeps the scrolling key row. */
+.kb-msg, .kb-key.keys-toggle { display: none; }
+body.agent-bar .kb-second {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: .3rem;
+}
+body.agent-bar .kb-second .kb-keys { display: none; grid-column: 1 / -1; }
+body.agent-bar.kb-more .kb-second .kb-keys { display: flex; }
+body.agent-bar .kb-second .compose-btn { display: none; }
+body.agent-bar .kb-key.keys-toggle { display: inline-block; }
+body.agent-bar.kb-more .kb-key.keys-toggle { color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
+body.agent-bar .kb-msg {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 .75rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 22px;
+  background: var(--bg);
+  color: var(--ink-3);
+  font: 400 13px/1.2 var(--mono);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  touch-action: manipulation;
+}
+body.agent-bar .kb-msg:active { border-color: var(--signal); }
+/* Composing: the text area is the field. */
+body.agent-bar.composing .kb-msg { display: none; }
+body.agent-bar.composing .kb-second { grid-template-columns: minmax(0, 1fr); justify-items: end; }
+
+/* A session's name, as typed (the UI mono, as the other sheets' titles). */
+#tv-title { font-family: var(--mono); font-size: 1.3rem; font-weight: 700; font-stretch: 87.5%; letter-spacing: 0; text-transform: none; overflow-wrap: anywhere; }
+
+/* --- text view ---------------------------------------------------------------- */
+/* The terminal's text as page text: the phone's own selection works on it. */
+.textview .tv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  padding: .2rem 1rem .6rem;
+  border-bottom: 1px solid var(--rule-2);
+}
+.textview .tv-actions .slab:disabled { opacity: .45; }
+.tv-text {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: .7rem 1rem 1.2rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 8;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 12.5px/1.5 var(--term);
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+}
+@media (pointer: coarse) { .textview .tv-actions .slab { min-height: 44px; } }
+
+/* --- Commands drawer, as a phone sheet -------------------------------------------- */
+/* The list gets the screen: each picker one row with its label, the hint goes (the
+   buttons say what they do), a command wraps to be read whole (its copy
+   is still exact), and its four actions sit two by two. */
+@media (max-width: 760px) {
+  .cmd-head { padding: .6rem .8rem .2rem; }
+  /* Each picker a row: its label beside it, the choice whole. */
+  .cmd-controls { display: grid; grid-template-columns: minmax(0, 1fr); gap: .35rem; padding: .2rem .8rem .5rem; }
+  .cmd-controls .cmd-field { flex-direction: row; align-items: center; gap: .5rem; }
+  .cmd-controls .cmd-field > span { width: 4.6rem; }
+  .cmd-field select { font-size: 16px; min-height: 44px; }
+  .cmd-hint { display: none; }
+  .cmd-list { padding: .5rem .6rem 1rem; }
+  .cmd-code { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; }
+  .cmd.overflows .cmd-code { -webkit-mask-image: none; mask-image: none; }
+  .cmd.overflows .cmd-meta::after { content: none; }
+  .cmd-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; }
+  .cmd-actions > * { width: 100%; margin: 0; justify-content: center; text-align: center; }
+  .reply-code, .reply-table { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .reply-block { padding-right: 2.9rem; }
+  .reply-block-copy { opacity: 1; min-width: 44px; min-height: 44px; top: 0; right: 0; }
+}
+
+/* --- sidebar: a workspace's header ---------------------------------------------- */
+/* A finger's tools (broadcast, settings, close) were three 44px buttons
+   beside the name, which left it one letter ("i...") under the count and
+   cost: on touch they take their own row under the name. */
+@media (pointer: coarse) {
+  .list-head { flex-wrap: wrap; row-gap: .35rem; }
+  .list-head .list-heading { flex: 1 1 0; }
+  .list-head .list-tools:not(:empty) { order: 3; flex: 1 0 100%; gap: .3rem; margin-left: -.35rem; }
+  #list-sub { flex-wrap: wrap; row-gap: .2rem; }
+}

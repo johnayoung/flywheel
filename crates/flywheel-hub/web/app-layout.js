@@ -103,12 +103,18 @@ const mobile = window.FwHubMobile({
 
 // A pane resizes its session's PTY (fits it to its box) only while it
 // has focus, or while this page is the session's only viewer; else it
-// follows the size another viewer set (panes.js).
+// follows the size another viewer set (panes.js). A phone never takes
+// the size from another viewer: squeezed to its few columns, an agent
+// redraws everything narrow (tables become unreadable), on the desktop
+// too. It follows, panned sideways by a swipe (mobile.js).
 function claimsSize(pane) {
   if (!pane.sessionId) return false;
-  if (pane === focusedPane()) return true;
   const session = sessionById(pane.sessionId);
-  return !!(session && session.live && (session.live.clients || 0) <= 1);
+  const sole = !!(session && session.live && (session.live.clients || 0) <= 1);
+  // `counted`: a viewer count arrived after this pane connected (app-base.js);
+  // until then a count of one is the other viewer, not this phone.
+  if (phone()) return sole && !!pane.counted;
+  return pane === focusedPane() || sole;
 }
 
 const panes = window.FwHubPanes({

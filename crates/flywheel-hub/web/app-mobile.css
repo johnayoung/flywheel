@@ -119,7 +119,9 @@ body.agent-bar.composing .kb-second { grid-template-columns: minmax(0, 1fr); jus
   .cmd.overflows .cmd-meta::after { content: none; }
   .cmd-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; }
   .cmd-actions > * { width: 100%; margin: 0; justify-content: center; text-align: center; }
-  .reply-code, .reply-table { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* Code wraps to be read whole; a table never does (wrapped, its columns
+     scramble): it scrolls sideways. */
+  .reply-code { white-space: pre-wrap; overflow-wrap: anywhere; }
   .reply-block { padding-right: 2.9rem; }
   .reply-block-copy { opacity: 1; min-width: 44px; min-height: 44px; top: 0; right: 0; }
 }
@@ -134,3 +136,14 @@ body.agent-bar.composing .kb-second { grid-template-columns: minmax(0, 1fr); jus
   .list-head .list-tools:not(:empty) { order: 3; flex: 1 0 100%; gap: .3rem; margin-left: -.35rem; }
   #list-sub { flex-wrap: wrap; row-gap: .2rem; }
 }
+
+/* --- A terminal wider than the phone ------------------------------------------------ */
+/* Following a desktop's columns, the terminal pans sideways (swipe); a fading
+   edge says there is more that way. */
+.pane-term.clip-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.4rem), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 1.4rem), transparent); }
+.pane-term.clip-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 1.4rem), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 1.4rem), transparent); }
+.pane-term.clip-left.clip-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 1.4rem, #000 calc(100% - 1.4rem), transparent); mask-image: linear-gradient(to right, transparent, #000 1.4rem, #000 calc(100% - 1.4rem), transparent); }
+
+/* The text view's tables (box-drawn rows) keep their columns: each run of them
+   scrolls sideways while the prose around it wraps. */
+.tv-table { display: block; overflow-x: auto; white-space: pre; overflow-wrap: normal; scrollbar-width: thin; }

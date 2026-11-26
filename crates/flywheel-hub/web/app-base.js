@@ -1026,6 +1026,7 @@ async function refresh(force = true) {
   // Viewer counts changed: a pane that became its session's only viewer
   // fits itself; one that no longer is follows the other viewer's size.
   for (const pane of livePanes()) {
+    if (pane.drawn) pane.counted = true;
     if (pane.term && pane.size && !pane.replaying && pane.claims() === pane.following) pane.claim();
   }
   const snapshot = JSON.stringify([ws, ss, machines.version()]);

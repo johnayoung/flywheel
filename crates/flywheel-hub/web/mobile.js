@@ -20,7 +20,9 @@
 //   by the last one to resize, so a short phone viewport (keyboard up) never
 //   shrinks it below MIN_ROWS; the terminal is then clipped around the
 //   cursor. A desktop pane fits its box exactly (a short split pane must
-//   not hide its top rows under the title bar).
+//   not hide its top rows under the title bar). Beside another viewer a
+//   phone never resizes the PTY (app-layout.js): it follows, and a
+//   sideways swipe pans a terminal wider than the screen.
 "use strict";
 
 // Options of the prompt lowest on a terminal's screen (`lines`: its
@@ -1033,15 +1035,26 @@ window.FwHubMobile = function (ctx) {
       }
       const point = event.touches[0];
       if (touch.mode === "pending") {
-        if (Math.hypot(point.clientX - touch.startX, point.clientY - touch.startY) < 8) return;
+        const dx = point.clientX - touch.startX;
+        const dy = point.clientY - touch.startY;
+        if (Math.hypot(dx, dy) < 8) return;
         clearTimeout(touch.hold);
-        touch.mode = "scroll";
+        // Sideways, on a terminal wider than the screen (following a
+        // desktop's columns): pan it. Else scroll.
+        const pane = ctx.pane();
+        touch.mode = Math.abs(dx) > Math.abs(dy) && pane && pane.panRoom && pane.panRoom() > 0 ? "pan" : "scroll";
       }
       event.preventDefault();
       event.stopPropagation();
       if (touch.mode === "select") {
         const cell = cellAt(point.clientX, point.clientY);
         if (cell && touch.anchor) selectBetween(touch.anchor, cell);
+        return;
+      }
+      if (touch.mode === "pan") {
+        const pane = ctx.pane();
+        if (pane && pane.panBy) pane.panBy(touch.lastX - point.clientX);
+        touch.lastX = point.clientX;
         return;
       }
       const dy = point.clientY - touch.lastY;
@@ -1069,6 +1082,8 @@ window.FwHubMobile = function (ctx) {
       } else if (mode === "scroll") {
         // A recent move carries on as momentum.
         if (event.timeStamp - touch.lastT < 80) flingFrom(touch.velocity);
+        event.preventDefault();
+      } else if (mode === "pan") {
         event.preventDefault();
       } else if (mode === "select") {
         event.preventDefault();
@@ -1196,6 +1211,29 @@ window.FwHubMobile = function (ctx) {
     return trimmed.slice(-TEXT_LINES).join("\n");
   }
 
+  // A table's row: box-drawn (an agent's rendered Markdown table, a
+  // framed panel) or pipe-delimited.
+  const TABLE_ROW = /[─━═│┃║┌┐└┘├┤┬┴┼╭╮╰╯]|^\s*\|.*\|\s*$/;
+
+  // Fill the text view: prose wraps to the phone; each run of table rows
+  // keeps its columns and scrolls sideways (.tv-table). Every segment
+  // but the last ends in its newline, so the box's text is `text` exactly
+  // (Copy all).
+  function fillText(box, text) {
+    box.textContent = "";
+    const runs = [];
+    for (const line of text.split("\n")) {
+      const table = TABLE_ROW.test(line);
+      const last = runs[runs.length - 1];
+      if (last && last.table === table) last.lines.push(line);
+      else runs.push({ table, lines: [line] });
+    }
+    runs.forEach((run, i) => {
+      const chunk = run.lines.join("\n") + (i < runs.length - 1 ? "\n" : "");
+      box.append(run.table ? el("span", { className: "tv-table", textContent: chunk }) : chunk);
+    });
+  }
+
   function textSelection() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) return "";
@@ -1216,7 +1254,7 @@ window.FwHubMobile = function (ctx) {
     $("#tv-replies").hidden = !ctx.isAgent(session);
     $("#tv-copy-sel").disabled = true;
     const box = $("#tv-text");
-    box.textContent = bufferText(t);
+    fillText(box, bufferText(t));
     sheet.hidden = false;
     $("#text-toggle").setAttribute("aria-pressed", "true");
     box.scrollTop = box.scrollHeight;

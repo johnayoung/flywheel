@@ -1037,8 +1037,11 @@ try {
   const tv = await mp.evaluate(() => {
     const box = document.querySelector("#tv-text");
     const text = box.textContent;
-    const node = box.firstChild;
-    const at = text.indexOf("fake claude");
+    // (Prose and table runs are separate nodes: the one with the text.)
+    const walk = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+    let node = null;
+    while (walk.nextNode()) if (walk.currentNode.textContent.includes("fake claude")) { node = walk.currentNode; break; }
+    const at = node ? node.textContent.indexOf("fake claude") : -1;
     const range = document.createRange();
     range.setStart(node, at);
     range.setEnd(node, at + "fake claude".length);
@@ -1059,6 +1062,61 @@ try {
   await mp.evaluate((id) => { location.hash = `session=${id}`; }, sids[1]);
   await mp.waitForFunction((id) => state.attached === id, sids[1], { timeout: 10000 });
   await mp.waitForTimeout(600);
+  // The text view keeps a table's columns (its rows scroll sideways) while
+  // the prose around it wraps, and its text is the terminal's exactly.
+  await api("POST", `/api/sessions/${sids[1]}/input`, {
+    data: "clear; printf '%s\\n' 'prose before' '| Service | Region | Status | Owner | Notes about the row |' '| api | us-east-1 | healthy | platform | rotated certs on the twentieth |' 'prose after'\r",
+  });
+  await mp.waitForTimeout(800);
+  await mp.tap("#text-toggle");
+  await mp.waitForSelector("#textview:not([hidden])", { timeout: 5000 });
+  const tables = await mp.evaluate(() => {
+    const box = document.querySelector("#tv-text");
+    const runs = [...box.querySelectorAll(".tv-table")];
+    const rows = runs.flatMap((r) => r.textContent.split("\n")).filter((l) => l.includes("| api |"));
+    return {
+      runs: runs.length,
+      unwrapped: runs.every((r) => getComputedStyle(r).whiteSpace === "pre"),
+      rows: rows.length,
+      prose: getComputedStyle(box).whiteSpace,
+      after: box.textContent.includes("\nprose after"),
+    };
+  });
+  check(tables.runs >= 1 && tables.unwrapped && tables.rows === 1 && tables.prose === "pre-wrap" && tables.after,
+    `phone: the text view keeps a table's columns and wraps the prose (${JSON.stringify(tables)})`);
+  await mp.tap("#tv-close");
+  // Desktop first: with a desktop watching too, the phone does not squeeze
+  // the PTY to its columns; it follows the desktop's, panned by a swipe.
+  // Alone again, it fits itself.
+  const both = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const dp = await both.newPage();
+  await dp.goto(`${base}/login?token=${token}#session=${sids[1]}`);
+  await dp.waitForFunction((id) => state.attached === id, sids[1], { timeout: 10000 });
+  await dp.waitForTimeout(1200);
+  const liveOf = async () => (await api("GET", "/api/sessions")).sessions.find((x) => x.id === sids[1]).live;
+  const deskCols = await dp.evaluate(() => state.solo ? state.solo.term.cols : [...state.panes.values()].find((p) => p.sessionId === state.attached).term.cols);
+  await mp.setViewportSize({ width: 390, height: 700 });
+  await mp.waitForTimeout(800);
+  const followed = await mp.evaluate(() => ({
+    following: document.querySelector(".pane-term").classList.contains("following"),
+    cols: state.solo.term.cols,
+    right: document.querySelector(".pane-term").classList.contains("clip-right"),
+  }));
+  const shared = await liveOf();
+  check(followed.following && followed.right && shared.cols === deskCols && followed.cols === deskCols,
+    `phone: beside a desktop, it follows the desktop's columns (${JSON.stringify({ followed, deskCols, pty: shared.cols })})`);
+  const panned = await mp.evaluate(() => {
+    const room = state.solo.panRoom();
+    const moved = state.solo.panBy(120);
+    return { room, moved, transform: state.solo.term.element.style.transform };
+  });
+  check(panned.room > 0 && panned.moved && /translateX\(-\d/.test(panned.transform), `phone: a terminal wider than the phone pans sideways (${JSON.stringify(panned)})`);
+  await both.close();
+  await mp.waitForFunction(() => !document.querySelector(".pane-term").classList.contains("following"), null, { timeout: 10000 }).catch(() => {});
+  await mp.setViewportSize({ width: 390, height: 844 });
+  await mp.waitForTimeout(800);
+  const alone = { cols: await mp.evaluate(() => state.solo.term.cols), pty: (await liveOf()).cols };
+  check(alone.cols < deskCols && alone.pty === alone.cols, `phone: alone again, it fits the PTY to itself (${JSON.stringify(alone)})`);
   // Every header button and key takes its own taps (nothing overlays them).
   const blocked = await mp.evaluate(() => {
     const targets = [

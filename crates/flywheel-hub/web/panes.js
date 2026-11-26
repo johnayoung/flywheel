@@ -304,6 +304,21 @@ window.FwHubPanes = function (ctx) {
         placeClip();
       });
     }
+    // A terminal wider than its box (a phone following a desktop's
+    // columns) is panned sideways: `pan` px from its left edge (panBy).
+    let pan = 0;
+    // Pan by `dx` px (positive: toward the right edge). False when there
+    // is nothing (more) to pan that way.
+    pane.panBy = (dx) => {
+      if (!clipGeom || !(clipGeom.wide > 0)) return false;
+      const next = Math.max(0, Math.min(clipGeom.wide, pan + dx));
+      if (next === pan) return false;
+      pan = next;
+      placeClip();
+      return true;
+    };
+    // How wide the hidden part is (0: the terminal fits its box).
+    pane.panRoom = () => (clipGeom && clipGeom.wide) || 0;
     function placeClip() {
       const xt = pane.term && pane.term.element;
       if (!xt || pane.disposed) return;
@@ -311,10 +326,18 @@ window.FwHubPanes = function (ctx) {
       let overflow = 0;
       if (host.classList.contains("following") || host.classList.contains("floored")) {
         if (!clipGeom) {
-          const pad = parseFloat(getComputedStyle(host).paddingTop) || 0;
-          clipGeom = { avail: host.clientHeight - pad, height: xt.offsetHeight };
+          const style = getComputedStyle(host);
+          const pad = parseFloat(style.paddingTop) || 0;
+          const padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+          const screen = xt.querySelector(".xterm-screen");
+          clipGeom = {
+            avail: host.clientHeight - pad,
+            height: xt.offsetHeight,
+            wide: Math.max(0, (screen ? screen.offsetWidth : 0) - (host.clientWidth - padX)),
+          };
         }
         const { avail, height } = clipGeom;
+        pan = Math.min(pan, clipGeom.wide);
         overflow = Math.max(0, height - avail);
         if (overflow > 0 && pane.term.rows > 0) {
           const rowH = height / pane.term.rows;
@@ -324,17 +347,23 @@ window.FwHubPanes = function (ctx) {
         }
       } else {
         clipGeom = null;
+        pan = 0;
       }
-      if (clipShown.el !== xt) clipShown = { el: xt, transform: null, above: null, below: null };
+      if (clipShown.el !== xt) clipShown = { el: xt, transform: null, above: null, below: null, left: null, right: null };
+      const moves = [pan > 0 ? `translateX(${-pan}px)` : "", shift > 0 ? `translateY(${-shift}px)` : ""];
       const shown = {
         el: xt,
-        transform: shift > 0 ? `translateY(${-shift}px)` : "",
+        transform: moves.filter(Boolean).join(" "),
         above: shift > 0.5,
         below: overflow - shift > 0.5,
+        left: pan > 0.5,
+        right: !!clipGeom && clipGeom.wide - pan > 0.5,
       };
       if (shown.transform !== clipShown.transform) xt.style.transform = shown.transform;
       if (shown.above !== clipShown.above) host.classList.toggle("clip-above", shown.above);
       if (shown.below !== clipShown.below) host.classList.toggle("clip-below", shown.below);
+      if (shown.left !== clipShown.left) host.classList.toggle("clip-left", shown.left);
+      if (shown.right !== clipShown.right) host.classList.toggle("clip-right", shown.right);
       clipShown = shown;
     }
 
@@ -785,6 +814,7 @@ window.FwHubPanes = function (ctx) {
           pane.seq = v2 ? message.seq : null;
           pane.epoch = v2 ? message.epoch : null;
           pane.replaying = true;
+          pane.counted = false;
           pane.size = { cols: message.cols, rows: message.rows };
           pane.following = true;
           term.resize(message.cols, message.rows);

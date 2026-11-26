@@ -1058,6 +1058,28 @@ try {
   check(await mp.evaluate(() => navigator.clipboard.readText()) === "fake claude", "phone: Copy selection copies the text view's selection exactly");
   await mp.tap("#tv-close");
   check(await mp.evaluate(() => document.querySelector("#textview").hidden), "phone: the text view closes");
+  // Touching the terminal (a swipe, a tap) never raises the on-screen
+  // keyboard: a focus it takes is quiet (inputmode=none); `kbd` raises it.
+  await mp.evaluate(() => document.activeElement && document.activeElement.blur());
+  const screenBox = await mp.locator(".pane-term .xterm-screen").first().boundingBox();
+  const touchCdp = await mp.context().newCDPSession(mp);
+  const tx = screenBox.x + screenBox.width / 2;
+  const ty = screenBox.y + Math.min(200, screenBox.height / 2);
+  await touchCdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: tx, y: ty }] });
+  for (let i = 1; i <= 6; i++) await touchCdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: tx, y: ty + i * 15 }] });
+  await touchCdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await mp.touchscreen.tap(tx, ty);
+  await mp.waitForTimeout(300);
+  const keyboardOf = () => mp.evaluate(() => {
+    const area = state.solo && state.solo.term.textarea;
+    return { focused: document.activeElement === area, mode: area ? area.inputMode : null };
+  });
+  const quiet = await keyboardOf();
+  check(!quiet.focused || quiet.mode === "none", `phone: a swipe or tap on the terminal raises no keyboard (${JSON.stringify(quiet)})`);
+  await mp.tap("#keybar .kbd-toggle");
+  const raised = await keyboardOf();
+  check(raised.focused && raised.mode === "", `phone: kbd raises the keyboard (${JSON.stringify(raised)})`);
+  await mp.tap("#keybar .kbd-toggle");
   await mp.screenshot({ path: path.join(out, "phone-agent-bar.png") });
   await mp.evaluate((id) => { location.hash = `session=${id}`; }, sids[1]);
   await mp.waitForFunction((id) => state.attached === id, sids[1], { timeout: 10000 });

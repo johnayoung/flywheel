@@ -7,6 +7,8 @@
 // * Key bar above the keyboard: Esc, Tab, Shift+Tab (Claude's
 //   permission-mode cycle), sticky Ctrl and Alt, arrows (held: repeat),
 //   Enter, ^C, a few symbols phone keyboards hide, font size, Compose.
+//   The keyboard rises only from `kbd` (or Compose): touching the
+//   terminal to scroll or tap never raises it.
 // * Quick answers while the attached agent is blocked: the options of the
 //   prompt on screen (Claude's numbered permission dialogs, a "(y/n)"
 //   line) as buttons.
@@ -534,11 +536,29 @@ window.FwHubMobile = function (ctx) {
     if (button) button.setAttribute("aria-pressed", String(moreKeysOn()));
   }
 
+  // The on-screen keyboard comes up only when asked for (`kbd`, Compose
+  // closing to type on): a touch on the terminal -- a swipe, the tap that
+  // stops a fling, a tap on a link -- may focus it, but with
+  // inputmode=none, so no keyboard rises over what was being read.
+  function quietKeyboard() {
+    const t = term();
+    const area = t && t.textarea;
+    if (area && document.activeElement !== area) area.inputMode = "none";
+  }
+  function showKeyboard() {
+    const t = term();
+    const area = t && t.textarea;
+    if (!area) return;
+    // A quiet focus shows no keyboard until it is focused anew.
+    if (area.inputMode === "none" && document.activeElement === area) t.blur();
+    area.inputMode = "";
+    t.focus();
+  }
   function toggleKeyboard() {
     const t = term();
     if (!t) return;
-    if (document.activeElement === t.textarea) t.blur();
-    else t.focus();
+    if (document.activeElement === t.textarea && t.textarea.inputMode !== "none") t.blur();
+    else showKeyboard();
   }
 
   // --- font size -------------------------------------------------------
@@ -752,7 +772,7 @@ window.FwHubMobile = function (ctx) {
     updateBar();
     document.body.classList.remove("composing");
     $("#compose-text").blur();
-    if (refocus && term()) term().focus();
+    if (refocus && term()) showKeyboard();
   }
 
   // Another session is attached: the text stays that session's draft (it
@@ -1004,6 +1024,7 @@ window.FwHubMobile = function (ctx) {
         return;
       }
       if (event.touches.length !== 1) return;
+      quietKeyboard();
       const point = event.touches[0];
       touch.mode = "pending";
       touch.startX = touch.lastX = point.clientX;

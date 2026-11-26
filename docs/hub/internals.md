@@ -104,7 +104,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 - **Needs you** (atop Everything, start screen): blocked, asking, failed (oldest first), `N finished`.
 - **Key bar** (touch): `esc` arrows `enter` `^c`; then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`. An agent's: a message field (Compose) under the keys, the rest behind `keys`.
 - **Quick answers**: a blocked dialog's options as buttons (AskUserQuestion's from its input, only while its question is on screen). **Compose**: multi-line text as one bracketed paste + Enter; history per device, drafts per session.
-- Swipe scrolls, long-press selects, pinch zooms. Tools are labelled, `copy` (Commands, Replies) and `text` first; **text**: the scrollback as page text for native selection (tables unwrapped), Copy all. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.
+- Swipe scrolls, long-press selects, pinch zooms; the keyboard rises only from `kbd` or Compose. Tools are labelled, `copy` (Commands, Replies) and `text` first; **text**: the scrollback as page text for native selection (tables unwrapped), Copy all. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.
 - **Lite mode** (Settings > Terminal; `auto`: the browser says slow, under 64 KB/s, or 3+ round trips at 300 ms+): paced terminals (protocol 2 `lite`), hidden panes none, side panels wait (60 s), re-lists every 3 s at most.
 - **Install**: PWA; offline, the cached page.
 

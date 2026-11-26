@@ -171,9 +171,13 @@ async function renameSession(id, name, refocus) {
   if (refocus) focusTerminal();
 }
 
+// On a phone the focus is quiet (inputmode=none): closing a drawer or
+// a dialog does not raise the on-screen keyboard; `kbd` does (mobile.js).
 function focusTerminal() {
   const term = focusedTerm();
-  if (term && !document.querySelector("dialog[open]") && !paletteOpen() && !search.isOpen() && !$("#ctx-menu")) term.focus();
+  if (!term || document.querySelector("dialog[open]") || paletteOpen() || search.isOpen() || $("#ctx-menu")) return;
+  if (phone() && term.textarea && document.activeElement !== term.textarea) term.textarea.inputMode = "none";
+  term.focus();
 }
 
 // Something over the terminal that owns the keys: a dialog, the
